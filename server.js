@@ -1,31 +1,37 @@
 /**
- * BrainSpark AI — Backend Server v4.0
- * Node.js + Express + Claude AI (Anthropic)
- *
- * Changes from v3.0:
- *  - Switched AI: Gemini/Groq → Claude (Anthropic)
- *  - Added social feed routes (/api/posts)
- *  - Added chapter course cache routes (/api/courses)
+ * BrainSpark AI — Backend Server v5.0
+ * Node.js + Express + Claude AI + OpenAI + Groq (fallback chain)
  *
  * INSTALL:
  *   npm install express cors bcryptjs jsonwebtoken express-rate-limit
  *              helmet morgan @supabase/supabase-js @anthropic-ai/sdk
  *              google-auth-library razorpay nodemailer crypto dotenv
+ *              openai groq-sdk multer csv-parser
+ *
+ * NEW ENV VARS (add to .env):
+ *   OPENAI_API_KEY=sk-...
+ *   GROQ_API_KEY=gsk_...
+ *   SUPABASE_STORAGE_BUCKET=brainspark-media
  */
 
-const express           = require('express');
-const cors              = require('cors');
-const bcrypt            = require('bcryptjs');
-const jwt               = require('jsonwebtoken');
-const rateLimit         = require('express-rate-limit');
-const helmet            = require('helmet');
-const morgan            = require('morgan');
-const { createClient }  = require('@supabase/supabase-js');
-const Anthropic         = require('@anthropic-ai/sdk');
-const { OAuth2Client }  = require('google-auth-library');
-const Razorpay          = require('razorpay');
-const nodemailer        = require('nodemailer');
-const crypto            = require('crypto');
+const express          = require('express');
+const cors             = require('cors');
+const bcrypt           = require('bcryptjs');
+const jwt              = require('jsonwebtoken');
+const rateLimit        = require('express-rate-limit');
+const helmet           = require('helmet');
+const morgan           = require('morgan');
+const { createClient } = require('@supabase/supabase-js');
+const Anthropic        = require('@anthropic-ai/sdk');
+const OpenAI           = require('openai');
+const Groq             = require('groq-sdk');
+const { OAuth2Client } = require('google-auth-library');
+const Razorpay         = require('razorpay');
+const nodemailer       = require('nodemailer');
+const crypto           = require('crypto');
+const multer           = require('multer');
+const csv              = require('csv-parser');
+const stream           = require('stream');
 require('dotenv').config();
 
 // ════════════════════════════════════════════════════════════════
@@ -40,7 +46,7 @@ app.use(cors({
   origin(origin, cb) {
     if (!origin) return cb(null, true);
     const allowed = [process.env.FRONTEND_URL, 'http://localhost:3000', 'http://localhost:5173'];
-    const ok = allowed.includes(origin) || origin.includes('vercel.app');
+    const ok = allowed.includes(origin) || origin.includes('vercel.app') || origin.includes('netlify.app');
     cb(ok ? null : new Error('CORS blocked'), ok);
   },
   credentials: true,
@@ -58,6 +64,12 @@ const db = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_K
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
+const openai = process.env.OPENAI_API_KEY
+  ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
+
+const groq = process.env.GROQ_API_KEY
+  ? new Groq({ apiKey: process.env.GROQ_API_KEY }) : null;
+
 const googleAuth = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
 const razorpay = process.env.RAZORPAY_KEY_ID
@@ -68,21 +80,82 @@ const mailer = process.env.EMAIL_USER
   ? nodemailer.createTransport({ service: 'gmail', auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS } })
   : null;
 
+// Multer for file uploads
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter(req, file, cb) {
+    const allowed = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'application/pdf'];
+    cb(null, allowed.includes(file.mimetype));
+  },
+});
+const uploadCSV = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
+
 // ════════════════════════════════════════════════════════════════
-//  AI — Claude (Anthropic)
+//  AI — Anthropic → OpenAI → Groq (fallback chain)
 // ════════════════════════════════════════════════════════════════
-async function callAI(messages, system = '', maxTokens = 2000) {
-  const response = await anthropic.messages.create({
-    model:      'claude-sonnet-4-5',
-    max_tokens: Math.min(maxTokens, 8096),
-    system:     system || undefined,
-    messages:   messages.map(m => ({
-      role:    m.role === 'assistant' ? 'assistant' : 'user',
-      content: m.content,
-    })),
-  });
-  const text = response.content[0].text;
-  return { text: text.replace(/```[\w]*\n?/gi, '').trim(), provider: 'claude' };
+const MODEL_TIER = {
+  doubt:      'claude-haiku-4-5-20251001',
+  flashcards: 'claude-haiku-4-5-20251001',
+  buddy:      'claude-haiku-4-5-20251001',
+  quiz:       'claude-sonnet-4-6',
+  notes:      'claude-sonnet-4-6',
+  paper:      'claude-sonnet-4-6',
+  cheatsheet: 'claude-sonnet-4-6',
+  lessonplan: 'claude-sonnet-4-6',
+};
+
+async function callAI(messages, system = '', maxTokens = 2000, tool = 'default') {
+  const claudeModel = MODEL_TIER[tool] || 'claude-sonnet-4-6';
+
+  // 1. Try Anthropic (Claude) — primary
+  try {
+    const response = await anthropic.messages.create({
+      model:      claudeModel,
+      max_tokens: Math.min(maxTokens, 8096),
+      system:     system || undefined,
+      messages:   messages.map(m => ({
+        role:    m.role === 'assistant' ? 'assistant' : 'user',
+        content: m.content,
+      })),
+    });
+    const text = response.content[0].text;
+    return { text: text.replace(/```[\w]*\n?/gi, '').trim(), provider: 'claude' };
+  } catch (e) {
+    console.warn('[Claude failed, trying OpenAI]', e.message?.slice(0, 80));
+  }
+
+  // 2. Try OpenAI — fallback 1
+  if (openai) {
+    try {
+      const msgs = [];
+      if (system) msgs.push({ role: 'system', content: system });
+      msgs.push(...messages.map(m => ({
+        role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content,
+      })));
+      const r = await openai.chat.completions.create({
+        model: 'gpt-4o-mini', max_tokens: Math.min(maxTokens, 4096), messages: msgs,
+      });
+      return { text: r.choices[0].message.content.trim(), provider: 'openai' };
+    } catch (e) {
+      console.warn('[OpenAI failed, trying Groq]', e.message?.slice(0, 80));
+    }
+  }
+
+  // 3. Try Groq — fallback 2
+  if (groq) {
+    const msgs = [];
+    if (system) msgs.push({ role: 'system', content: system });
+    msgs.push(...messages.map(m => ({
+      role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content,
+    })));
+    const r = await groq.chat.completions.create({
+      model: 'llama3-70b-8192', max_tokens: Math.min(maxTokens, 4096), messages: msgs,
+    });
+    return { text: r.choices[0].message.content.trim(), provider: 'groq' };
+  }
+
+  throw new Error('All AI providers failed. Please try again.');
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -129,25 +202,44 @@ function verifyAdmin(req, res, next) {
 }
 
 // ════════════════════════════════════════════════════════════════
-//  Free-Tier Middleware (personal users: 60 min free)
+//  FREE TIER — Wall-clock 10 minutes from first AI call
 // ════════════════════════════════════════════════════════════════
+const FREE_WINDOW_SECONDS = 600; // 10 minutes
+
 async function checkAccess(req, res, next) {
   if (req.user.type === 'school') return next();
+
   const { data: u } = await db.from('users')
-    .select('subscription_status, subscription_expires_at, free_tier_minutes_used, free_tier_exhausted')
+    .select('subscription_status, subscription_expires_at, free_tier_started_at')
     .eq('id', req.user.id).single();
+
+  // Active paid subscriber
   if (u?.subscription_status === 'active' && u.subscription_expires_at && new Date(u.subscription_expires_at) > new Date()) {
     return next();
   }
-  if (u?.free_tier_exhausted || (u?.free_tier_minutes_used || 0) >= 60) {
-    await db.from('users').update({ free_tier_exhausted: true }).eq('id', req.user.id);
+
+  // First ever AI call — start the clock
+  if (!u?.free_tier_started_at) {
+    await db.from('users')
+      .update({ free_tier_started_at: new Date().toISOString() })
+      .eq('id', req.user.id);
+    req.freeSecondsRemaining = FREE_WINDOW_SECONDS;
+    return next();
+  }
+
+  // Calculate remaining wall-clock time
+  const elapsed   = Math.floor((Date.now() - new Date(u.free_tier_started_at)) / 1000);
+  const remaining = FREE_WINDOW_SECONDS - elapsed;
+
+  if (remaining <= 0) {
     return res.status(402).json({
-      error: 'Your free 1-hour trial has ended.',
-      code: 'SUBSCRIPTION_REQUIRED',
-      minutesUsed: u?.free_tier_minutes_used || 60,
+      error:            'Your 10-minute free trial has ended.',
+      code:             'SUBSCRIPTION_REQUIRED',
+      secondsRemaining: 0,
     });
   }
-  req.freeMinutesRemaining = 60 - (u?.free_tier_minutes_used || 0);
+
+  req.freeSecondsRemaining = remaining;
   next();
 }
 
@@ -169,7 +261,7 @@ async function logActivity(userId, tool, opts = {}) {
     await db.rpc('update_streak', { p_user_id: userId });
     const counters = {
       doubt: 'doubts_solved', quiz: 'quizzes_done', notes: 'notes_made',
-      paper: 'papers_made', flashcards: 'flashcards_made',
+      paper: 'papers_made',   flashcards: 'flashcards_made',
       cheatsheet: 'cheat_sheets_made', lessonplan: 'lesson_plans_made',
     };
     if (counters[tool]) await db.rpc('increment_counter', { p_user_id: userId, p_field: counters[tool] });
@@ -184,18 +276,10 @@ async function logActivity(userId, tool, opts = {}) {
       const subjects = [...new Set([...(xpRow.subjects_used || []), ...(subject ? [subject] : [])])];
       await db.from('user_xp').update({ tools_used_today: tools, tools_used_today_date: today, subjects_used: subjects }).eq('user_id', userId);
     }
-    const { data: uRow } = await db.from('users').select('type, free_tier_minutes_used').eq('id', userId).single();
-    if (uRow?.type === 'personal') {
-      const used = (uRow.free_tier_minutes_used || 0) + 2;
-      await db.from('users').update({ free_tier_minutes_used: used, free_tier_exhausted: used >= 60, last_active_at: new Date().toISOString() }).eq('id', userId);
-    }
     checkAchievements(userId).catch(() => {});
   } catch (e) { console.error('[logActivity]', e.message); }
 }
 
-// ════════════════════════════════════════════════════════════════
-//  Achievement Engine
-// ════════════════════════════════════════════════════════════════
 async function checkAchievements(userId) {
   const [{ data: stats }, { data: user }, { data: all }, { data: unlocked }] = await Promise.all([
     db.from('user_xp').select('*').eq('user_id', userId).single(),
@@ -387,8 +471,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
     });
     const resetLink = `${process.env.FRONTEND_URL}/reset-password?token=${token}`;
     await mailer.sendMail({
-      from:    `"BrainSpark AI" <${process.env.EMAIL_USER}>`,
-      to:      email,
+      from: `"BrainSpark AI" <${process.env.EMAIL_USER}>`, to: email,
       subject: 'Reset your BrainSpark AI password',
       html: `<div style="font-family:sans-serif;max-width:480px;margin:auto;padding:24px"><h2 style="color:#6366F1">Password Reset</h2><p>Hi ${user.name},</p><p>Click below to reset your password. This link expires in 1 hour.</p><a href="${resetLink}" style="display:inline-block;margin:20px 0;padding:12px 24px;background:#6366F1;color:#fff;text-decoration:none;border-radius:8px;font-weight:700">Reset Password</a><p style="color:#888;font-size:12px">If you didn't request this, ignore this email.</p></div>`,
     });
@@ -412,7 +495,9 @@ app.post('/api/auth/reset-password', async (req, res) => {
 
 app.get('/api/auth/me', verifyToken, async (req, res) => {
   try {
-    const { data: user } = await db.from('users').select('*, schools(name, school_code, logo_url)').eq('id', req.user.id).maybeSingle();
+    const { data: user } = await db.from('users')
+      .select('*, schools(name, school_code, logo_url)')
+      .eq('id', req.user.id).maybeSingle();
     if (!user) return res.status(404).json({ error: 'User not found' });
     res.json(safeUser(user));
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -436,13 +521,13 @@ app.put('/api/user/profile', verifyToken, async (req, res) => {
   try {
     const { name, bio, phone, classLevel, section, subjectSpecialization, preferredSubjects } = req.body;
     const { data: user, error } = await db.from('users').update({
-      ...(name                             && { name: name.trim() }),
-      ...(bio                !== undefined && { bio }),
-      ...(phone              !== undefined && { phone }),
-      ...(classLevel         !== undefined && { class_level: classLevel }),
-      ...(section            !== undefined && { section }),
+      ...(name                              && { name: name.trim() }),
+      ...(bio               !== undefined   && { bio }),
+      ...(phone             !== undefined   && { phone }),
+      ...(classLevel        !== undefined   && { class_level: classLevel }),
+      ...(section           !== undefined   && { section }),
       ...(subjectSpecialization !== undefined && { subject_specialization: subjectSpecialization }),
-      ...(preferredSubjects     !== undefined && { preferred_subjects: preferredSubjects }),
+      ...(preferredSubjects !== undefined   && { preferred_subjects: preferredSubjects }),
       updated_at: new Date().toISOString(),
     }).eq('id', req.user.id).select().single();
     if (error) throw error;
@@ -482,8 +567,20 @@ app.get('/api/user/achievements', verifyToken, async (req, res) => {
 });
 
 app.get('/api/user/subscription', verifyToken, async (req, res) => {
-  const { data: user } = await db.from('users').select('subscription_status, subscription_plan, subscription_expires_at, free_tier_minutes_used, free_tier_exhausted, type, role').eq('id', req.user.id).single();
-  res.json(user);
+  const { data: user } = await db.from('users')
+    .select('subscription_status, subscription_plan, subscription_expires_at, free_tier_started_at, type, role')
+    .eq('id', req.user.id).single();
+  // Calculate seconds remaining for frontend
+  let freeSecondsRemaining = null;
+  if (user?.type === 'personal' && user.subscription_status !== 'active') {
+    if (!user.free_tier_started_at) {
+      freeSecondsRemaining = FREE_WINDOW_SECONDS; // not started yet
+    } else {
+      const elapsed = Math.floor((Date.now() - new Date(user.free_tier_started_at)) / 1000);
+      freeSecondsRemaining = Math.max(0, FREE_WINDOW_SECONDS - elapsed);
+    }
+  }
+  res.json({ ...user, freeSecondsRemaining });
 });
 
 // Saved Notes
@@ -574,32 +671,64 @@ app.post('/api/user/quiz-history', verifyToken, async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════
-//  ROUTES: SOCIAL FEED
+//  ROUTES: MEDIA UPLOAD
+// ════════════════════════════════════════════════════════════════
+app.post('/api/upload/media', verifyToken, upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file provided' });
+    const ext  = req.file.originalname.split('.').pop().toLowerCase();
+    const name = `${req.user.id}/${Date.now()}-${crypto.randomBytes(6).toString('hex')}.${ext}`;
+    const { error } = await db.storage
+      .from(process.env.SUPABASE_STORAGE_BUCKET || 'brainspark-media')
+      .upload(name, req.file.buffer, { contentType: req.file.mimetype });
+    if (error) throw error;
+    const { data: urlData } = db.storage
+      .from(process.env.SUPABASE_STORAGE_BUCKET || 'brainspark-media')
+      .getPublicUrl(name);
+    res.json({
+      url:  urlData.publicUrl,
+      type: req.file.mimetype.startsWith('image/') ? 'image' : 'pdf',
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ════════════════════════════════════════════════════════════════
+//  ROUTES: SOCIAL FEED (with media + rich comments)
 // ════════════════════════════════════════════════════════════════
 app.get('/api/posts', verifyToken, async (req, res) => {
-  const { data } = await db.from('posts')
-    .select('*')
-    .order('created_at', { ascending: false })
-    .limit(100);
-  res.json(data || []);
+  try {
+    let query = db.from('posts').select('*').order('created_at', { ascending: false }).limit(100);
+    // School users only see posts from their school
+    if (req.user.type === 'school') {
+      const { data: u } = await db.from('users').select('school_id').eq('id', req.user.id).single();
+      query = query.eq('school_id', u.school_id);
+    } else {
+      query = query.is('school_id', null);
+    }
+    const { data } = await query;
+    res.json(data || []);
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/posts', verifyToken, async (req, res) => {
   try {
-    const { body, subj, tags, anon, grad } = req.body;
-    if (!body?.trim()) return res.status(400).json({ error: 'Post cannot be empty' });
-    const { data: user } = await db.from('users').select('name, class_level').eq('id', req.user.id).single();
+    const { body, subj, tags, anon, grad, media_url, media_type } = req.body;
+    if (!body?.trim() && !media_url) return res.status(400).json({ error: 'Post cannot be empty' });
+    const { data: user } = await db.from('users').select('name, class_level, school_id').eq('id', req.user.id).single();
     const { data, error } = await db.from('posts').insert({
-      uid:      anon ? null : req.user.id,
-      uname:    anon ? 'Anonymous Student' : user.name,
-      ucls:     user.class_level || 'Class 10',
-      subj:     subj || 'General',
-      body:     body.trim(),
-      tags:     tags || [],
-      likes:    0,
-      comments: [],
-      anon:     !!anon,
-      grad:     grad || '135deg,#6366F1,#8B5CF6',
+      uid:           anon ? null : req.user.id,
+      uname:         anon ? 'Anonymous Student' : user.name,
+      ucls:          user.class_level || 'Student',
+      subj:          subj || 'General',
+      body:          body?.trim() || '',
+      tags:          tags || [],
+      likes:         0,
+      rich_comments: [],
+      anon:          !!anon,
+      grad:          grad || '135deg,#6366F1,#8B5CF6',
+      media_url:     media_url || null,
+      media_type:    media_type || null,
+      school_id:     req.user.type === 'school' ? user.school_id : null,
     }).select().single();
     if (error) throw error;
     res.status(201).json(data);
@@ -619,15 +748,29 @@ app.patch('/api/posts/:id/like', verifyToken, async (req, res) => {
 
 app.post('/api/posts/:id/comment', verifyToken, async (req, res) => {
   try {
-    const { text } = req.body;
-    if (!text?.trim()) return res.status(400).json({ error: 'Comment cannot be empty' });
-    try {
-      await db.rpc('append_post_comment', { p_post_id: req.params.id, p_comment: text.trim() });
-    } catch {
-      const { data: post } = await db.from('posts').select('comments').eq('id', req.params.id).single();
-      await db.from('posts').update({ comments: [...(post?.comments || []), text.trim()] }).eq('id', req.params.id);
+    const { text, media_url, media_type } = req.body;
+    if (!text?.trim() && !media_url) return res.status(400).json({ error: 'Comment cannot be empty' });
+
+    const { data: post } = await db.from('posts').select('rich_comments, school_id').eq('id', req.params.id).single();
+
+    // School isolation
+    if (post?.school_id && req.user.type === 'school') {
+      const { data: u } = await db.from('users').select('school_id').eq('id', req.user.id).single();
+      if (u.school_id !== post.school_id) return res.status(403).json({ error: 'Access denied' });
     }
-    res.json({ success: true });
+
+    const comment = {
+      id:          crypto.randomUUID(),
+      author_id:   req.user.id,
+      author_name: req.user.name || 'User',
+      text:        text?.trim() || '',
+      media_url:   media_url || null,
+      media_type:  media_type || null,
+      created_at:  new Date().toISOString(),
+    };
+    const updated = [...(post?.rich_comments || []), comment];
+    await db.from('posts').update({ rich_comments: updated }).eq('id', req.params.id);
+    res.json(comment);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -635,10 +778,7 @@ app.post('/api/posts/:id/comment', verifyToken, async (req, res) => {
 //  ROUTES: CHAPTER COURSE CACHE
 // ════════════════════════════════════════════════════════════════
 app.get('/api/courses/:key', async (req, res) => {
-  const { data } = await db.from('chapter_cache')
-    .select('*')
-    .eq('cache_key', req.params.key)
-    .maybeSingle();
+  const { data } = await db.from('chapter_cache').select('*').eq('cache_key', req.params.key).maybeSingle();
   res.json(data || null);
 });
 
@@ -647,15 +787,8 @@ app.post('/api/courses', verifyToken, async (req, res) => {
     const { cacheKey, notes, qa, quiz, subject, cls, chapter } = req.body;
     if (!cacheKey) return res.status(400).json({ error: 'cacheKey required' });
     const { data, error } = await db.from('chapter_cache').upsert({
-      cache_key:    cacheKey,
-      notes,
-      qa,
-      quiz,
-      subject,
-      class_level:  cls,
-      chapter,
-      generated_by: req.user.id,
-      updated_at:   new Date().toISOString(),
+      cache_key: cacheKey, notes, qa, quiz, subject, class_level: cls, chapter,
+      generated_by: req.user.id, updated_at: new Date().toISOString(),
     }, { onConflict: 'cache_key' }).select().single();
     if (error) throw error;
     res.json(data);
@@ -663,16 +796,583 @@ app.post('/api/courses', verifyToken, async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════
-//  ROUTES: AI (all protected + access-checked)
+//  ROUTES: SEARCH
+// ════════════════════════════════════════════════════════════════
+app.get('/api/search', verifyToken, async (req, res) => {
+  const { q } = req.query;
+  if (!q || q.length < 2) return res.json([]);
+  try {
+    if (req.user.type === 'school') {
+      const { data: me } = await db.from('users').select('school_id').eq('id', req.user.id).single();
+      const { data } = await db.from('users')
+        .select('id, name, role, class_level, section, avatar_url, subject_specialization')
+        .eq('school_id', me.school_id).ilike('name', `%${q}%`).limit(20);
+      return res.json(data || []);
+    }
+    const { data } = await db.from('users')
+      .select('id, name, role, class_level, bio, avatar_url')
+      .eq('type', 'personal').ilike('name', `%${q}%`).limit(20);
+    res.json(data || []);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ════════════════════════════════════════════════════════════════
+//  ROUTES: PROFILES (LinkedIn-style)
+// ════════════════════════════════════════════════════════════════
+app.get('/api/profiles/:userId', verifyToken, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    // School isolation check
+    if (req.user.type === 'school') {
+      const [{ data: me }, { data: them }] = await Promise.all([
+        db.from('users').select('school_id').eq('id', req.user.id).single(),
+        db.from('users').select('school_id').eq('id', userId).single(),
+      ]);
+      if (!them || me.school_id !== them.school_id)
+        return res.status(403).json({ error: 'Cannot view profiles from other schools' });
+    }
+    const [userRes, profileRes, xpRes] = await Promise.all([
+      db.from('users').select('id, name, role, class_level, section, subject_specialization, school_id, created_at, type, bio, avatar_url').eq('id', userId).single(),
+      db.from('user_profiles').select('*').eq('user_id', userId).maybeSingle(),
+      db.from('user_xp').select('total_xp, current_streak, doubts_solved, quizzes_done, notes_made, papers_made, cheat_sheets_made, lesson_plans_made').eq('user_id', userId).single(),
+    ]);
+    // XP rank
+    const { data: rankData } = await db.rpc('get_xp_ranking', { p_user_id: userId }).catch(() => ({ data: null }));
+    res.json({
+      user:    userRes.data,
+      profile: profileRes.data || {},
+      stats:   xpRes.data || {},
+      rank:    rankData?.[0] || {},
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.put('/api/profiles/me', verifyToken, async (req, res) => {
+  try {
+    const { headline, about, location, website_url, skills, languages, hobbies,
+            certifications, experience, education, visibility, banner_url } = req.body;
+    const { data, error } = await db.from('user_profiles').upsert({
+      user_id: req.user.id, headline, about, location, website_url, skills, languages,
+      hobbies, certifications, experience, education, visibility, banner_url,
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'user_id' }).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ════════════════════════════════════════════════════════════════
+//  ROUTES: MESSAGING
+// ════════════════════════════════════════════════════════════════
+async function canMessage(senderId, receiverId) {
+  const [{ data: sender }, { data: receiver }] = await Promise.all([
+    db.from('users').select('role, school_id, type').eq('id', senderId).single(),
+    db.from('users').select('role, school_id, type').eq('id', receiverId).single(),
+  ]);
+  if (!sender || !receiver) return false;
+  // School users: must be same school + no student↔student
+  if (sender.type === 'school' || receiver.type === 'school') {
+    if (sender.school_id !== receiver.school_id) return false;
+    if (sender.role === 'student' && receiver.role === 'student') return false;
+  }
+  return true;
+}
+
+app.get('/api/conversations', verifyToken, async (req, res) => {
+  try {
+    const { data } = await db.from('conversations')
+      .select('id, participant_ids, last_message, last_message_at, created_at')
+      .contains('participant_ids', [req.user.id])
+      .order('last_message_at', { ascending: false });
+    // Fetch other participant info
+    const enriched = await Promise.all((data || []).map(async c => {
+      const otherId = c.participant_ids.find(id => id !== req.user.id);
+      const { data: other } = await db.from('users').select('id, name, role, class_level, avatar_url').eq('id', otherId).single();
+      return { ...c, other };
+    }));
+    res.json(enriched);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/conversations', verifyToken, async (req, res) => {
+  try {
+    const { receiverId } = req.body;
+    if (!await canMessage(req.user.id, receiverId))
+      return res.status(403).json({ error: 'Messaging not allowed between these users' });
+    const participants = [req.user.id, receiverId].sort();
+    const { data: existing } = await db.from('conversations')
+      .select('id').contains('participant_ids', participants).maybeSingle();
+    if (existing) return res.json(existing);
+    const { data: u } = await db.from('users').select('school_id').eq('id', req.user.id).single();
+    const { data, error } = await db.from('conversations').insert({
+      participant_ids: participants, school_id: u.school_id || null,
+    }).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/conversations/:id/messages', verifyToken, async (req, res) => {
+  try {
+    const { data: conv } = await db.from('conversations').select('participant_ids').eq('id', req.params.id).single();
+    if (!conv?.participant_ids.includes(req.user.id)) return res.status(403).json({ error: 'Forbidden' });
+    const { data } = await db.from('messages')
+      .select('id, sender_id, content, media_url, media_type, created_at')
+      .eq('conversation_id', req.params.id)
+      .order('created_at', { ascending: true }).limit(100);
+    res.json(data || []);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/conversations/:id/messages', verifyToken, async (req, res) => {
+  try {
+    const { content, media_url, media_type } = req.body;
+    if (!content?.trim() && !media_url) return res.status(400).json({ error: 'Empty message' });
+    const { data: conv } = await db.from('conversations').select('participant_ids').eq('id', req.params.id).single();
+    if (!conv?.participant_ids.includes(req.user.id)) return res.status(403).json({ error: 'Forbidden' });
+    const { data, error } = await db.from('messages').insert({
+      conversation_id: req.params.id, sender_id: req.user.id,
+      content: content?.trim() || null, media_url: media_url || null, media_type: media_type || null,
+    }).select().single();
+    if (error) throw error;
+    await db.from('conversations').update({
+      last_message_at: new Date().toISOString(),
+      last_message:    content?.slice(0, 80) || '📷 Media',
+    }).eq('id', req.params.id);
+    res.json(data);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ════════════════════════════════════════════════════════════════
+//  ROUTES: SCHOOL — NOTICES
+// ════════════════════════════════════════════════════════════════
+app.get('/api/school/notices', verifyToken, async (req, res) => {
+  const { data: u } = await db.from('users').select('school_id').eq('id', req.user.id).single();
+  if (!u?.school_id) return res.json([]);
+  const { data } = await db.from('school_notices').select('*')
+    .eq('school_id', u.school_id)
+    .order('is_pinned', { ascending: false })
+    .order('created_at',  { ascending: false }).limit(50);
+  res.json(data || []);
+});
+
+app.post('/api/school/notices', verifyToken, async (req, res) => {
+  const { data: u } = await db.from('users').select('school_id, role').eq('id', req.user.id).single();
+  if (!['admin', 'principal', 'teacher'].includes(u?.role))
+    return res.status(403).json({ error: 'Only admin/teachers can post notices' });
+  // Only admin can post school-wide notices
+  const { title, content, notice_type, target_audience, media_url, is_pinned, expires_at } = req.body;
+  if (target_audience === 'all' && u.role === 'teacher')
+    return res.status(403).json({ error: 'Only admin can post school-wide notices' });
+  const { data, error } = await db.from('school_notices').insert({
+    school_id: u.school_id, title, content, notice_type: notice_type || 'general',
+    target_audience: target_audience || 'all', media_url: media_url || null,
+    is_pinned: is_pinned || false, expires_at: expires_at || null, posted_by: req.user.id,
+  }).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.status(201).json(data);
+});
+
+// ════════════════════════════════════════════════════════════════
+//  ROUTES: SCHOOL — TIMETABLE
+// ════════════════════════════════════════════════════════════════
+app.get('/api/school/timetable', verifyToken, async (req, res) => {
+  const { data: u } = await db.from('users').select('school_id, class_level, section').eq('id', req.user.id).single();
+  if (!u?.school_id) return res.json(null);
+  const { data } = await db.from('timetables').select('*')
+    .eq('school_id', u.school_id)
+    .eq('class_level', u.class_level || '').maybeSingle();
+  res.json(data || null);
+});
+
+app.post('/api/school/timetable', verifyToken, async (req, res) => {
+  const { data: u } = await db.from('users').select('school_id, role').eq('id', req.user.id).single();
+  if (!['teacher', 'admin'].includes(u?.role)) return res.status(403).json({ error: 'Teachers only' });
+  const { class_level, section, schedule, academic_year } = req.body;
+  const { data, error } = await db.from('timetables').upsert({
+    school_id: u.school_id, class_level, section, schedule,
+    academic_year: academic_year || '2024-25', uploaded_by: req.user.id,
+    updated_at: new Date().toISOString(),
+  }, { onConflict: 'school_id,class_level,section' }).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+// ════════════════════════════════════════════════════════════════
+//  ROUTES: ASSIGNMENTS
+// ════════════════════════════════════════════════════════════════
+app.get('/api/assignments', verifyToken, async (req, res) => {
+  const { data: u } = await db.from('users').select('school_id, role, class_level, section').eq('id', req.user.id).single();
+  if (!u?.school_id) return res.json([]);
+  let query = db.from('assignments').select('*, users!teacher_id(name)').eq('school_id', u.school_id);
+  if (u.role === 'teacher') {
+    query = query.eq('teacher_id', req.user.id);
+  } else {
+    query = query.eq('class_level', u.class_level);
+  }
+  const { data } = await query.order('deadline', { ascending: true });
+  res.json(data || []);
+});
+
+app.post('/api/assignments', verifyToken, async (req, res) => {
+  const { data: u } = await db.from('users').select('school_id, role').eq('id', req.user.id).single();
+  if (u?.role !== 'teacher') return res.status(403).json({ error: 'Teachers only' });
+  const { title, description, subject, class_level, section, chapters, total_marks,
+          deadline, answer_type, grading_notes, question_paper_url, question_paper_text, questions_json } = req.body;
+  if (!title || !deadline) return res.status(400).json({ error: 'Title and deadline are required' });
+  const { data, error } = await db.from('assignments').insert({
+    school_id: u.school_id, teacher_id: req.user.id, title, description, subject,
+    class_level, section: section || null, chapters: chapters || [], total_marks: total_marks || 0,
+    deadline, answer_type: answer_type || 'both', grading_notes: grading_notes || '',
+    question_paper_url: question_paper_url || null,
+    question_paper_text: question_paper_text || null,
+    questions_json: questions_json || null,
+  }).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.status(201).json(data);
+});
+
+app.post('/api/assignments/generate-paper', verifyToken, async (req, res) => {
+  const { data: u } = await db.from('users').select('role').eq('id', req.user.id).single();
+  if (u?.role !== 'teacher') return res.status(403).json({ error: 'Teachers only' });
+  const { subject, class_level, chapters, marks, answer_type, teacher_notes, question_types } = req.body;
+  const prompt = `Create a formal CBSE ${marks}-mark assignment question paper.
+Subject: ${subject} | Class: ${class_level}
+Chapters covered: ${(chapters || []).join(', ')}
+Expected answer format: ${answer_type || 'both'} (text or PDF upload)
+Teacher's grading priorities: ${teacher_notes || 'Standard CBSE grading'}
+Preferred question types: ${question_types || 'Mix of MCQ, Short Answer, Long Answer'}
+
+IMPORTANT: Number every question clearly as Q1., Q2., etc. with marks in brackets like [2 marks].
+Write a clean, professional question paper. After the paper, write exactly: ===JSON===
+Then return ONLY this JSON (no markdown, no explanation):
+{"questions":[{"q_num":1,"question":"full question text","type":"mcq","max_marks":2},{"q_num":2,"question":"...","type":"short","max_marks":5}]}`;
+  try {
+    const r = await callAI([{ role: 'user', content: prompt }], '', 4000, 'paper');
+    const sepIdx = r.text.indexOf('===JSON===');
+    let paperText = r.text, questionsJson = null;
+    if (sepIdx > -1) {
+      paperText = r.text.slice(0, sepIdx).trim();
+      try { questionsJson = JSON.parse(r.text.slice(sepIdx + 10).trim()); } catch {}
+    }
+    res.json({ paper_text: paperText, questions_json: questionsJson, provider: r.provider });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/assignments/:id/submit', verifyToken, upload.single('pdf'), async (req, res) => {
+  try {
+    const { data: assignment } = await db.from('assignments').select('*').eq('id', req.params.id).single();
+    if (!assignment) return res.status(404).json({ error: 'Assignment not found' });
+    const isLate = new Date() > new Date(assignment.deadline);
+    let pdf_url = null, answers_text = null, submission_type = 'text';
+    if (req.file) {
+      const name = `assignments/${req.user.id}/${req.params.id}-${Date.now()}.pdf`;
+      const { error: uploadErr } = await db.storage
+        .from(process.env.SUPABASE_STORAGE_BUCKET || 'brainspark-media')
+        .upload(name, req.file.buffer, { contentType: 'application/pdf' });
+      if (uploadErr) throw uploadErr;
+      const { data: urlData } = db.storage
+        .from(process.env.SUPABASE_STORAGE_BUCKET || 'brainspark-media')
+        .getPublicUrl(name);
+      pdf_url = urlData.publicUrl;
+      submission_type = 'pdf';
+    } else {
+      const raw = req.body.answers;
+      answers_text = raw ? (typeof raw === 'string' ? JSON.parse(raw) : raw) : [];
+      submission_type = 'text';
+    }
+    const { data, error } = await db.from('assignment_submissions').upsert({
+      assignment_id: req.params.id, student_id: req.user.id,
+      school_id: assignment.school_id, submission_type,
+      answers_text, pdf_url, is_late: isLate,
+      submitted_at: new Date().toISOString(),
+    }, { onConflict: 'assignment_id,student_id' }).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/assignments/:id/analysis/me', verifyToken, async (req, res) => {
+  const { data } = await db.from('assignment_analysis')
+    .select('*').eq('assignment_id', req.params.id).eq('student_id', req.user.id).maybeSingle();
+  res.json(data || null);
+});
+
+app.get('/api/assignments/:id/analysis/all', verifyToken, async (req, res) => {
+  const { data: u } = await db.from('users').select('role').eq('id', req.user.id).single();
+  if (u?.role !== 'teacher') return res.status(403).json({ error: 'Teachers only' });
+  const { data } = await db.from('assignment_analysis')
+    .select('*, users!student_id(name, class_level, section, roll_number)')
+    .eq('assignment_id', req.params.id);
+  res.json(data || []);
+});
+
+// ════════════════════════════════════════════════════════════════
+//  ASSIGNMENT AUTO-ANALYSIS ENGINE (runs every 15 min)
+// ════════════════════════════════════════════════════════════════
+async function analyzeTextSubmission(assignment, submission) {
+  const prompt = `You are an expert CBSE teacher grading an assignment.
+
+ASSIGNMENT: "${assignment.title}"
+SUBJECT: ${assignment.subject} | TOTAL MARKS: ${assignment.total_marks}
+QUESTIONS: ${JSON.stringify(assignment.questions_json?.questions || [])}
+TEACHER GRADING PREFERENCES: ${assignment.grading_notes || 'Standard CBSE grading. Award marks for correct method.'}
+
+STUDENT ANSWERS: ${JSON.stringify(submission.answers_text)}
+
+CRITICAL: Match answers to questions by question NUMBER only (Q1 answer → Q1 question, Q2 → Q2, etc.)
+Give detailed, constructive feedback for each answer.
+
+Return ONLY this JSON (no markdown):
+{
+  "questions_analysis": [
+    {"q_num": 1, "marks_awarded": 3, "marks_max": 5, "feedback": "Good explanation but missed the formula derivation.", "improvement_tip": "Always show the derivation step in your working.", "correctness_pct": 70}
+  ],
+  "total_marks_awarded": 18,
+  "total_marks_max": 25,
+  "overall_feedback": "Well-structured answers. Focus on showing working steps.",
+  "strengths": ["Good conceptual understanding", "Neat presentation"],
+  "improvements": ["Show derivations", "Elaborate on definitions"]
+}`;
+  const r = await callAI([{ role: 'user', content: prompt }], '', 3000, 'notes');
+  const parsed = JSON.parse(r.text.replace(/```[\w]*\n?/g, '').trim());
+  return { ...parsed, ai_provider: r.provider };
+}
+
+async function analyzePDFSubmission(assignment, submission) {
+  const prompt = `You are an expert CBSE teacher grading a handwritten assignment.
+
+ASSIGNMENT: "${assignment.title}"
+SUBJECT: ${assignment.subject} | TOTAL MARKS: ${assignment.total_marks}
+QUESTIONS: ${JSON.stringify(assignment.questions_json?.questions || [])}
+GRADING PREFERENCES: ${assignment.grading_notes || 'Standard CBSE'}
+
+CRITICAL: Match student answers to questions by question number (Q1., Q2., etc.) ONLY.
+
+Analyze the handwritten answers and return ONLY this JSON:
+{
+  "questions_analysis": [{"q_num": 1, "marks_awarded": 3, "marks_max": 5, "feedback": "...", "improvement_tip": "..."}],
+  "total_marks_awarded": 18, "total_marks_max": 25,
+  "overall_feedback": "...",
+  "strengths": ["..."], "improvements": ["..."],
+  "handwriting_quality": "good",
+  "handwriting_tips": "Your handwriting is clear. Try to maintain consistent letter size."
+}`;
+  const r = await anthropic.messages.create({
+    model: 'claude-sonnet-4-6', max_tokens: 3000,
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'document', source: { type: 'url', url: submission.pdf_url } },
+        { type: 'text', text: prompt },
+      ],
+    }],
+  });
+  const text = r.content[0].text.replace(/```[\w]*\n?/g, '').trim();
+  const parsed = JSON.parse(text);
+  return { ...parsed, ai_provider: 'claude' };
+}
+
+async function runAssignmentAnalysis() {
+  try {
+    const { data: pending } = await db.from('assignments')
+      .select('id').eq('status', 'active').lt('deadline', new Date().toISOString());
+    for (const a of pending || []) {
+      await db.from('assignments').update({ status: 'closed' }).eq('id', a.id);
+      const { data: submissions } = await db.from('assignment_submissions')
+        .select('*').eq('assignment_id', a.id);
+      const { data: assignment } = await db.from('assignments').select('*').eq('id', a.id).single();
+      for (const sub of submissions || []) {
+        const { data: existing } = await db.from('assignment_analysis')
+          .select('id').eq('submission_id', sub.id).maybeSingle();
+        if (existing) continue;
+        try {
+          let result;
+          if (sub.submission_type === 'pdf' && sub.pdf_url) {
+            result = await analyzePDFSubmission(assignment, sub);
+          } else {
+            result = await analyzeTextSubmission(assignment, sub);
+          }
+          await db.from('assignment_analysis').insert({
+            submission_id: sub.id, assignment_id: a.id,
+            student_id: sub.student_id, school_id: sub.school_id,
+            ...result, analyzed_at: new Date().toISOString(),
+          });
+        } catch (e) { console.error('[analysis error]', e.message); }
+      }
+    }
+  } catch (e) { console.error('[runAssignmentAnalysis]', e.message); }
+}
+
+setInterval(runAssignmentAnalysis, 15 * 60 * 1000);
+
+// ════════════════════════════════════════════════════════════════
+//  ROUTES: AI BUDDY
+// ════════════════════════════════════════════════════════════════
+async function getBuddyContext(userId) {
+  const sevenDaysAgo = new Date(Date.now() - 7 * 86400000).toISOString();
+  const { data: u } = await db.from('users').select('school_id, role, name, class_level').eq('id', userId).single();
+  const [activity, xpData, memories] = await Promise.all([
+    db.from('activity_log').select('tool, subject, chapter, created_at').eq('user_id', userId).gte('created_at', sevenDaysAgo).limit(20),
+    db.from('user_xp').select('total_xp, current_streak, doubts_solved, quizzes_done, notes_made').eq('user_id', userId).single(),
+    db.from('ai_buddy_memories').select('memory, importance').eq('user_id', userId).order('importance', { ascending: false }).limit(15),
+  ]);
+  let schoolContext = '';
+  if (u?.school_id) {
+    const [notices, assignments] = await Promise.all([
+      db.from('school_notices').select('title, notice_type').eq('school_id', u.school_id).gte('created_at', sevenDaysAgo).limit(5),
+      db.from('assignments').select('title, subject, deadline').eq('school_id', u.school_id).gt('deadline', new Date().toISOString()).limit(5),
+    ]);
+    schoolContext = `
+Recent school notices: ${(notices.data || []).map(n => `[${n.notice_type}] ${n.title}`).join(' | ')}
+Upcoming assignments: ${(assignments.data || []).map(a => `${a.subject}: "${a.title}" due ${new Date(a.deadline).toLocaleDateString('en-IN')}`).join(' | ')}`;
+  }
+  return `You are ${u?.name || 'a student'}'s AI Study Buddy — warm, encouraging, and genuinely helpful like a caring friend who truly knows them.
+
+WHO THEY ARE:
+- Name: ${u?.name} | Role: ${u?.role} | Class: ${u?.class_level || 'N/A'}
+- XP: ${xpData.data?.total_xp || 0} | Streak: ${xpData.data?.current_streak || 0} days
+- Doubts: ${xpData.data?.doubts_solved || 0} | Quizzes: ${xpData.data?.quizzes_done || 0}
+
+RECENT ACTIVITY (7 days): ${(activity.data || []).slice(0, 10).map(a => `${a.tool}(${a.subject})`).join(', ') || 'None yet'}
+${schoolContext}
+WHAT I REMEMBER ABOUT THEM: ${(memories.data || []).map(m => m.memory).join('; ') || 'This is our first conversation!'}
+
+Guidelines: Be like a real friend — concise (2-4 sentences), warm, specific to their context. Use their name. Reference their actual data. Ask good questions. Give actionable suggestions. Use emojis sparingly. When they're stressed, acknowledge it first before helping.`;
+}
+
+async function extractBuddyMemories(userId, conversation) {
+  if (conversation.length < 4) return;
+  try {
+    const r = await callAI([{
+      role: 'user',
+      content: `From this conversation, identify 0-3 IMPORTANT long-term facts about this person to remember (goals, struggles, key events, preferences, milestones). Be specific and concise.
+Return ONLY valid JSON array (empty [] if nothing worth remembering):
+[{"memory": "Student is preparing for IIT JEE and finds organic chemistry very hard", "importance": 5, "category": "goal"}]
+Conversation: ${JSON.stringify(conversation.slice(-6))}`,
+    }], '', 400, 'buddy');
+    const memories = JSON.parse(r.text.replace(/```[\w]*\n?/g, '').trim());
+    if (Array.isArray(memories) && memories.length > 0) {
+      await db.from('ai_buddy_memories').insert(memories.map(m => ({ user_id: userId, ...m })));
+    }
+  } catch {}
+}
+
+app.post('/api/buddy/chat', verifyToken, async (req, res) => {
+  try {
+    const { message, sessionMessages = [] } = req.body;
+    if (!message?.trim()) return res.status(400).json({ error: 'Message required' });
+    const systemPrompt = await getBuddyContext(req.user.id);
+    const messages = [
+      ...sessionMessages.slice(-10),
+      { role: 'user', content: message },
+    ];
+    const r = await callAI(messages, systemPrompt, 600, 'buddy');
+    extractBuddyMemories(req.user.id, [...messages, { role: 'assistant', content: r.text }]).catch(() => {});
+    const today = new Date().toISOString().split('T')[0];
+    const { data: existing } = await db.from('ai_buddy_conversations')
+      .select('id, messages').eq('user_id', req.user.id).eq('session_date', today).maybeSingle();
+    const newMessages = [
+      ...(existing?.messages || []),
+      { role: 'user', content: message, ts: new Date().toISOString() },
+      { role: 'assistant', content: r.text, ts: new Date().toISOString() },
+    ];
+    await db.from('ai_buddy_conversations').upsert(
+      { user_id: req.user.id, session_date: today, messages: newMessages, updated_at: new Date().toISOString() },
+      { onConflict: 'user_id,session_date' }
+    );
+    res.json({ content: r.text, provider: r.provider });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ════════════════════════════════════════════════════════════════
+//  ROUTES: SCHOOL ADMIN ANALYTICS
+// ════════════════════════════════════════════════════════════════
+app.get('/api/school/analytics', verifyToken, async (req, res) => {
+  const { data: u } = await db.from('users').select('school_id, role').eq('id', req.user.id).single();
+  if (!['admin', 'teacher'].includes(u?.role)) return res.status(403).json({ error: 'Admin/Teacher only' });
+  const { data } = await db.from('school_analytics').select('*').eq('school_id', u.school_id);
+  res.json(data || []);
+});
+
+// ════════════════════════════════════════════════════════════════
+//  ROUTES: SCHOOL DATA UPLOAD (CSV)
+// ════════════════════════════════════════════════════════════════
+app.post('/api/admin/schools/:code/upload/students-csv', verifyAdmin, uploadCSV.single('file'), async (req, res) => {
+  try {
+    const { data: school } = await db.from('schools').select('id').eq('school_code', req.params.code.toUpperCase()).single();
+    if (!school) return res.status(404).json({ error: 'School not found' });
+    const rows = [];
+    const readable = stream.Readable.from(req.file.buffer.toString());
+    await new Promise((resolve, reject) => {
+      readable.pipe(csv()).on('data', row => rows.push(row)).on('end', resolve).on('error', reject);
+    });
+    const students = await Promise.all(rows.filter(r => r.roll_number && r.name).map(async r => ({
+      school_id: school.id, roll_number: r.roll_number?.trim(), name: r.name?.trim(),
+      class_level: r.class_level?.trim() || '', section: r.section?.trim() || '',
+      email: r.email || null, phone: r.phone || null,
+      parent_name: r.parent_name || null, parent_phone: r.parent_phone || null,
+      password_hash: await bcrypt.hash(r.password || r.roll_number?.trim(), 12),
+    })));
+    const { data, error } = await db.from('school_students')
+      .upsert(students, { onConflict: 'school_id,roll_number' }).select();
+    if (error) throw error;
+    res.json({ success: true, imported: data.length });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/admin/schools/:code/upload/teachers-csv', verifyAdmin, uploadCSV.single('file'), async (req, res) => {
+  try {
+    const { data: school } = await db.from('schools').select('id').eq('school_code', req.params.code.toUpperCase()).single();
+    if (!school) return res.status(404).json({ error: 'School not found' });
+    const rows = [];
+    const readable = stream.Readable.from(req.file.buffer.toString());
+    await new Promise((resolve, reject) => {
+      readable.pipe(csv()).on('data', row => rows.push(row)).on('end', resolve).on('error', reject);
+    });
+    const teachers = await Promise.all(rows.filter(r => r.employee_id && r.name).map(async r => ({
+      school_id: school.id, employee_id: r.employee_id?.trim(), name: r.name?.trim(),
+      subjects: r.subjects ? r.subjects.split('|').map(s => s.trim()) : [],
+      email: r.email || null, phone: r.phone || null, qualification: r.qualification || null,
+      password_hash: await bcrypt.hash(r.password || r.employee_id?.trim(), 12),
+    })));
+    const { data, error } = await db.from('school_teachers')
+      .upsert(teachers, { onConflict: 'school_id,employee_id' }).select();
+    if (error) throw error;
+    res.json({ success: true, imported: data.length });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/admin/schools', verifyAdmin, async (req, res) => {
+  try {
+    const { name, schoolCode, address, city, state, contactEmail, contactPhone, maxStudents = 500, maxTeachers = 50 } = req.body;
+    if (!name || !schoolCode) return res.status(400).json({ error: 'Name and code required' });
+    const { data, error } = await db.from('schools').insert({
+      name: name.trim(), school_code: schoolCode.toUpperCase().trim(), address, city, state,
+      contact_email: contactEmail, contact_phone: contactPhone, max_students: maxStudents, max_teachers: maxTeachers,
+    }).select().single();
+    if (error?.code === '23505') return res.status(409).json({ error: 'School code already exists' });
+    if (error) throw error;
+    res.status(201).json(data);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/admin/schools', verifyAdmin, async (req, res) => {
+  const { data } = await db.from('schools').select('*').order('created_at', { ascending: false });
+  res.json(data || []);
+});
+
+// ════════════════════════════════════════════════════════════════
+//  ROUTES: AI TOOLS
 // ════════════════════════════════════════════════════════════════
 const AI_CONFIGS = {
-  doubt:      { xp: 15, maxTokens: 800,   label: 'doubt'      },
-  quiz:       { xp: 5,  maxTokens: 7500,  label: 'quiz'       },
-  notes:      { xp: 20, maxTokens: 7500,  label: 'notes'      },
-  paper:      { xp: 25, maxTokens: 8000,  label: 'paper'      },
-  flashcards: { xp: 15, maxTokens: 2000,  label: 'flashcards' },
-  cheatsheet: { xp: 30, maxTokens: 8096,  label: 'cheatsheet' },
-  lessonplan: { xp: 30, maxTokens: 4000,  label: 'lessonplan' },
+  doubt:      { xp: 15, maxTokens: 800,  label: 'doubt'      },
+  quiz:       { xp: 5,  maxTokens: 7500, label: 'quiz'       },
+  notes:      { xp: 20, maxTokens: 7500, label: 'notes'      },
+  paper:      { xp: 25, maxTokens: 8000, label: 'paper'      },
+  flashcards: { xp: 15, maxTokens: 2000, label: 'flashcards' },
+  cheatsheet: { xp: 30, maxTokens: 8096, label: 'cheatsheet' },
+  lessonplan: { xp: 30, maxTokens: 4000, label: 'lessonplan' },
 };
 
 app.post('/api/ai/:tool', verifyToken, checkAccess, aiLimiter, async (req, res) => {
@@ -681,10 +1381,10 @@ app.post('/api/ai/:tool', verifyToken, checkAccess, aiLimiter, async (req, res) 
   try {
     const { messages, system = '', subject = '', chapter = '', chapters = [] } = req.body;
     if (!Array.isArray(messages) || !messages.length) return res.status(400).json({ error: 'Messages array required' });
-    const { text, provider } = await callAI(messages, system, cfg.maxTokens);
+    const { text, provider } = await callAI(messages, system, cfg.maxTokens, cfg.label);
     logActivity(req.user.id, cfg.label, { subject, chapter, chapters, xpEarned: cfg.xp, provider, meta: { subject, chapter } }).catch(console.error);
     const resp = { content: text, xpEarned: cfg.xp, provider };
-    if (req.freeMinutesRemaining !== undefined) resp.freeMinutesRemaining = Math.max(0, req.freeMinutesRemaining - 2);
+    if (req.freeSecondsRemaining !== undefined) resp.secondsRemaining = req.freeSecondsRemaining;
     res.json(resp);
   } catch (e) {
     console.error(`[AI /${req.params.tool}]`, e.message);
@@ -694,7 +1394,7 @@ app.post('/api/ai/:tool', verifyToken, checkAccess, aiLimiter, async (req, res) 
 });
 
 // ════════════════════════════════════════════════════════════════
-//  ROUTES: SUBSCRIPTION (Razorpay)
+//  ROUTES: SUBSCRIPTION
 // ════════════════════════════════════════════════════════════════
 const PLANS = {
   student_monthly:  { amount: 15000,  label: 'Student Monthly',  months: 1  },
@@ -710,10 +1410,9 @@ app.post('/api/subscription/create-order', verifyToken, async (req, res) => {
     const plan = PLANS[planType];
     if (!plan) return res.status(400).json({ error: 'Invalid plan' });
     const order = await razorpay.orders.create({
-      amount:   plan.amount,
-      currency: 'INR',
-      receipt:  `bs_${req.user.id.slice(0, 8)}_${Date.now()}`,
-      notes:    { userId: req.user.id, planType },
+      amount: plan.amount, currency: 'INR',
+      receipt: `bs_${req.user.id.slice(0, 8)}_${Date.now()}`,
+      notes: { userId: req.user.id, planType },
     });
     await db.from('subscriptions').insert({
       user_id: req.user.id, plan_type: planType,
@@ -734,7 +1433,7 @@ app.post('/api/subscription/verify', verifyToken, async (req, res) => {
     const exp  = new Date(Date.now() + plan.months * 30 * 24 * 60 * 60 * 1000);
     await db.from('subscriptions').update({
       razorpay_payment_id: paymentId, razorpay_signature: signature,
-      status: 'active', starts_at: new Date().toISOString(), expires_at: exp.toISOString(), updated_at: new Date().toISOString(),
+      status: 'active', starts_at: new Date().toISOString(), expires_at: exp.toISOString(),
     }).eq('razorpay_order_id', orderId);
     await db.from('users').update({
       subscription_status: 'active', subscription_plan: planType, subscription_expires_at: exp.toISOString(),
@@ -743,99 +1442,25 @@ app.post('/api/subscription/verify', verifyToken, async (req, res) => {
   } catch (e) { console.error('[verify]', e); res.status(500).json({ error: 'Verification error.' }); }
 });
 
-app.post('/api/subscription/school', verifyAdmin, async (req, res) => {
-  try {
-    const { schoolCode, studentCount = 0, teacherCount = 0, planMonths = 12 } = req.body;
-    const { data: school } = await db.from('schools').select('id').eq('school_code', schoolCode.toUpperCase()).maybeSingle();
-    if (!school) return res.status(404).json({ error: 'School not found' });
-    const stuTotal = studentCount * (planMonths >= 12 ? 130000 : 13000);
-    const tchTotal = teacherCount * (planMonths >= 12 ? 150000 : 15000);
-    const total    = stuTotal + tchTotal;
-    const exp = new Date(Date.now() + planMonths * 30 * 24 * 60 * 60 * 1000);
-    await db.from('schools').update({ subscription_status: 'active', subscription_expires_at: exp.toISOString(), student_slots: studentCount, teacher_slots: teacherCount }).eq('id', school.id);
-    await db.from('subscriptions').insert({ school_id: school.id, plan_type: 'school', amount_paise: total, status: 'active', starts_at: new Date().toISOString(), expires_at: exp.toISOString(), student_count: studentCount, teacher_count: teacherCount });
-    res.json({ success: true, expiresAt: exp.toISOString(), totalPaise: total });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
 // ════════════════════════════════════════════════════════════════
-//  ROUTES: SCHOOL ADMIN
-// ════════════════════════════════════════════════════════════════
-app.post('/api/admin/schools', verifyAdmin, async (req, res) => {
-  try {
-    const { name, schoolCode, address, city, state, contactEmail, contactPhone, maxStudents = 500, maxTeachers = 50 } = req.body;
-    if (!name || !schoolCode) return res.status(400).json({ error: 'Name and code required' });
-    const { data, error } = await db.from('schools').insert({ name: name.trim(), school_code: schoolCode.toUpperCase().trim(), address, city, state, contact_email: contactEmail, contact_phone: contactPhone, max_students: maxStudents, max_teachers: maxTeachers }).select().single();
-    if (error?.code === '23505') return res.status(409).json({ error: 'School code already exists' });
-    if (error) throw error;
-    res.status(201).json(data);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.get('/api/admin/schools', verifyAdmin, async (req, res) => {
-  const { data } = await db.from('schools').select('*').order('created_at', { ascending: false });
-  res.json(data || []);
-});
-
-app.post('/api/admin/schools/:code/students', verifyAdmin, async (req, res) => {
-  try {
-    const { data: school } = await db.from('schools').select('id').eq('school_code', req.params.code.toUpperCase()).maybeSingle();
-    if (!school) return res.status(404).json({ error: 'School not found' });
-    const { students } = req.body;
-    if (!Array.isArray(students) || !students.length) return res.status(400).json({ error: 'students array required' });
-    const rows = await Promise.all(students.map(async s => ({
-      school_id: school.id, roll_number: s.rollNumber?.trim(), name: s.name?.trim(),
-      class_level: s.class || s.classLevel || '', section: s.section || '',
-      email: s.email || null, phone: s.phone || null,
-      parent_name: s.parentName || null, parent_phone: s.parentPhone || null,
-      password_hash: await bcrypt.hash(s.password || s.rollNumber?.trim(), 12),
-    })));
-    const { data, error } = await db.from('school_students').upsert(rows, { onConflict: 'school_id,roll_number' }).select();
-    if (error) throw error;
-    res.json({ success: true, imported: data.length });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/api/admin/schools/:code/teachers', verifyAdmin, async (req, res) => {
-  try {
-    const { data: school } = await db.from('schools').select('id').eq('school_code', req.params.code.toUpperCase()).maybeSingle();
-    if (!school) return res.status(404).json({ error: 'School not found' });
-    const { teachers } = req.body;
-    if (!Array.isArray(teachers) || !teachers.length) return res.status(400).json({ error: 'teachers array required' });
-    const rows = await Promise.all(teachers.map(async t => ({
-      school_id: school.id, employee_id: t.employeeId?.trim(), name: t.name?.trim(),
-      subjects: t.subjects || [], email: t.email || null, phone: t.phone || null,
-      qualification: t.qualification || null, experience_years: t.experienceYears || null,
-      password_hash: await bcrypt.hash(t.password || t.employeeId?.trim(), 12),
-    })));
-    const { data, error } = await db.from('school_teachers').upsert(rows, { onConflict: 'school_id,employee_id' }).select();
-    if (error) throw error;
-    res.json({ success: true, imported: data.length });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.get('/api/admin/schools/:code/students', verifyAdmin, async (req, res) => {
-  const { data: school } = await db.from('schools').select('id').eq('school_code', req.params.code.toUpperCase()).maybeSingle();
-  if (!school) return res.status(404).json({ error: 'School not found' });
-  const { data } = await db.from('school_students').select('roll_number,name,class_level,section,is_active,created_at').eq('school_id', school.id).order('class_level').order('roll_number');
-  res.json(data || []);
-});
-
-app.put('/api/admin/schools/:code/status', verifyAdmin, async (req, res) => {
-  const { data } = await db.from('schools').update({ is_active: req.body.isActive }).eq('school_code', req.params.code.toUpperCase()).select().single();
-  res.json(data);
-});
-
-// ════════════════════════════════════════════════════════════════
-//  HEALTH
+//  HEALTH CHECK
 // ════════════════════════════════════════════════════════════════
 app.get('/health', async (req, res) => {
   let ai = 'unknown';
   try {
-    await anthropic.messages.create({ model: 'claude-sonnet-4-5', max_tokens: 10, messages: [{ role: 'user', content: 'ok' }] });
-    ai = 'ok';
-  } catch (e) { ai = `error: ${e.message.slice(0, 40)}`; }
-  res.json({ status: 'ok', time: new Date().toISOString(), version: '4.0.0', ai, razorpay: !!razorpay, email: !!mailer });
+    await anthropic.messages.create({ model: 'claude-haiku-4-5-20251001', max_tokens: 10, messages: [{ role: 'user', content: 'ok' }] });
+    ai = 'claude:ok';
+  } catch (e) { ai = `claude:error`; }
+  res.json({
+    status:   'ok',
+    time:     new Date().toISOString(),
+    version:  '5.0.0',
+    ai,
+    openai:   !!openai,
+    groq:     !!groq,
+    razorpay: !!razorpay,
+    email:    !!mailer,
+  });
 });
 
 // ════════════════════════════════════════════════════════════════
@@ -845,9 +1470,11 @@ app.use((err, req, res, next) => { console.error('[Unhandled]', err); res.status
 app.use((req, res) => res.status(404).json({ error: `Not found: ${req.method} ${req.path}` }));
 
 app.listen(PORT, () => {
-  console.log(`\n🚀 BrainSpark AI v4 — http://localhost:${PORT}`);
+  console.log(`\n🚀 BrainSpark AI v5 — http://localhost:${PORT}`);
   console.log(`   Claude:   ${process.env.ANTHROPIC_API_KEY ? '✅' : '❌ MISSING'}`);
-  console.log(`   Supabase: ${process.env.SUPABASE_URL      ? '✅' : '❌ MISSING'}`);
-  console.log(`   Razorpay: ${process.env.RAZORPAY_KEY_ID   ? '✅' : '⚠️  not set (payments disabled)'}`);
-  console.log(`   Email:    ${process.env.EMAIL_USER        ? '✅' : '⚠️  not set (password reset disabled)'}\n`);
+  console.log(`   OpenAI:   ${process.env.OPENAI_API_KEY   ? '✅' : '⚠️  not set (fallback disabled)'}`);
+  console.log(`   Groq:     ${process.env.GROQ_API_KEY     ? '✅' : '⚠️  not set (fallback disabled)'}`);
+  console.log(`   Supabase: ${process.env.SUPABASE_URL     ? '✅' : '❌ MISSING'}`);
+  console.log(`   Razorpay: ${process.env.RAZORPAY_KEY_ID  ? '✅' : '⚠️  not set (payments disabled)'}`);
+  console.log(`   Email:    ${process.env.EMAIL_USER       ? '✅' : '⚠️  not set (password reset disabled)'}\n`);
 });
