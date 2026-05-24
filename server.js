@@ -32,6 +32,7 @@ const crypto           = require('crypto');
 const multer           = require('multer');
 const csv              = require('csv-parser');
 const stream           = require('stream');
+const { YoutubeTranscript } = require('youtube-transcript');
 require('dotenv').config();
 
 // ════════════════════════════════════════════════════════════════
@@ -1488,6 +1489,514 @@ app.post('/api/subscription/verify', verifyToken, async (req, res) => {
     res.json({ success: true, expiresAt: exp.toISOString() });
   } catch (e) { console.error('[verify]', e); res.status(500).json({ error: 'Verification error.' }); }
 });
+
+
+
+async function ytSearch(query, n = 5) {
+  if (!process.env.YOUTUBE_API_KEY) return [];
+  try {
+    const url = new URL('https://www.googleapis.com/youtube/v3/search');
+    url.searchParams.set('part',            'snippet');
+    url.searchParams.set('q',               query);
+    url.searchParams.set('maxResults',      String(n));
+    url.searchParams.set('type',            'video');
+    url.searchParams.set('videoEmbeddable', 'true');
+    url.searchParams.set('relevanceLanguage', 'en');
+    url.searchParams.set('key',             process.env.YOUTUBE_API_KEY);
+
+    const r    = await fetch(url.toString(), { signal: AbortSignal.timeout(8000) });
+    const data = await r.json();
+    if (!r.ok) { console.warn('[ytSearch]', data?.error?.message); return []; }
+
+    return (data.items || []).map(item => ({
+      videoId:   item.id.videoId,
+      title:     item.snippet.title,
+      channel:   item.snippet.channelTitle,
+      thumbnail: item.snippet.thumbnails?.medium?.url
+                 || `https://img.youtube.com/vi/${item.id.videoId}/mqdefault.jpg`,
+      description: (item.snippet.description || '').slice(0, 160),
+    }));
+  } catch (e) {
+    console.warn('[ytSearch error]', e.message?.slice(0, 80));
+    return [];
+  }
+}
+
+/**
+ * Fetch transcript for a single video. Returns plain-text string or null.
+ * Trims to maxChars to stay within Claude context limits.
+ */
+async function ytTranscript(videoId, maxChars = 8000) {
+  if (!videoId) return null;
+  try {
+    // Try English first, then any language
+    let segs;
+    try { segs = await YoutubeTranscript.fetchTranscript(videoId, { lang: 'en' }); }
+    catch { segs = await YoutubeTranscript.fetchTranscript(videoId); }
+
+    if (!segs?.length) return null;
+    const text = segs.map(s => s.text).join(' ').replace(/\s+/g, ' ').trim();
+    return text.length > 200 ? text.slice(0, maxChars) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Try to get a good transcript from a list of videos.
+ * Tries each video in order and returns the first one with ≥500 chars.
+ */
+async function getBestTranscript(videos) {
+  for (const v of (videos || []).slice(0, 5)) {
+    if (!v?.videoId) continue;
+    const t = await ytTranscript(v.videoId);
+    if (t && t.length >= 500) return { transcript: t, videoId: v.videoId };
+  }
+  return { transcript: null, videoId: videos?.[0]?.videoId || null };
+}
+
+// ════════════════════════════════════════════════════════════════
+//  AI HELPERS — module-specific prompts
+// ════════════════════════════════════════════════════════════════
+
+/** Generate the list of 8-15 modules for a chapter using Claude */
+async function aiGenerateModuleList(subject, cls, chapter, moduleCount = 10) {
+  const prompt = `You are an expert CBSE curriculum designer.
+Break down the CBSE chapter "${chapter}" (${subject}, ${cls}) into exactly ${moduleCount} focused learning modules.
+Each module should cover a distinct sub-topic that can be taught via a single YouTube video (10-20 min).
+Module ${moduleCount} should be a "Practice & Exam Tips" or "Solved Examples" module.
+
+Return ONLY valid JSON (no markdown):
+{
+  "modules": [
+    {
+      "id": 1,
+      "title": "Introduction to ${chapter}",
+      "description": "Brief description under 40 words",
+      "emoji": "🔢",
+      "estimatedMinutes": 15,
+      "keyTopics": ["topic1", "topic2", "topic3"],
+      "searchQuery": "specific YouTube search query for this sub-topic CBSE"
+    }
+  ]
+}`;
+  const r = await callAI([{ role: 'user', content: prompt }], '', 2000, 'notes');
+  try {
+    const parsed = JSON.parse(r.text.replace(/```[\w]*\n?/g, '').trim());
+    return parsed?.modules || null;
+  } catch { return null; }
+}
+
+/** Generate notes + Q&A + quiz for one module using transcript (or fallback to topic knowledge) */
+async function aiGenerateModuleContent(moduleTitle, chapter, subject, cls, transcript) {
+  const transcriptSection = transcript
+    ? `Use this YouTube video transcript as your PRIMARY source. Base notes, Q&A and quiz STRICTLY on what the transcript teaches:\n\n"${transcript.slice(0, 7000)}"\n\nSupplement with CBSE knowledge only where the transcript is insufficient.`
+    : `No transcript available. Use your expert CBSE knowledge of "${moduleTitle}" in ${subject} ${cls}.`;
+
+  const prompt = `You are an expert CBSE teacher creating learning content.
+Module: "${moduleTitle}"
+Chapter: "${chapter}" | Subject: ${subject} | Class: ${cls} | Board: CBSE
+
+${transcriptSection}
+
+Return ONLY valid JSON (no markdown, no preamble):
+{
+  "notes": {
+    "summary": "3-4 substantial paragraphs covering the module content",
+    "keyConcepts": [{"term": "string", "definition": "1-2 sentences"}],
+    "keyPoints": ["10 key points as complete sentences with explanation"],
+    "formulas": ["formulas with units and when to use them — empty array if not applicable"],
+    "solvedExample": "One worked example relevant to this module (null if not applicable)",
+    "commonMistakes": ["3 common mistakes students make"],
+    "examTips": ["3 specific exam tips for this sub-topic"]
+  },
+  "qa": [
+    {"q": "question", "a": "3-4 sentence answer", "difficulty": "Easy|Medium|Hard"}
+  ],
+  "quiz": [
+    {"q": "question text", "opts": ["A", "B", "C", "D"], "ans": 0, "exp": "explanation why correct"}
+  ]
+}
+Include exactly 6 Q&A items and 8 quiz questions. "ans" is 0-indexed.`;
+
+  const r = await callAI([{ role: 'user', content: prompt }], '', 5000, 'notes');
+  try {
+    const parsed = JSON.parse(r.text.replace(/```[\w]*\n?/g, '').trim());
+    if (!parsed?.notes) throw new Error('No notes');
+    return { notes: parsed.notes, qa: parsed.qa || [], quiz: parsed.quiz || [] };
+  } catch {
+    return {
+      notes: {
+        summary: `Content for "${moduleTitle}" is being prepared. Please retry in a moment.`,
+        keyConcepts: [], keyPoints: [], formulas: [], solvedExample: null, commonMistakes: [], examTips: [],
+      },
+      qa: [], quiz: [],
+    };
+  }
+}
+
+// ════════════════════════════════════════════════════════════════
+//  SSE EVENT BUS (in-memory, for real-time progress streaming)
+// ════════════════════════════════════════════════════════════════
+const { EventEmitter } = require('events');
+const moduleEventBus = new Map(); // courseKey → EventEmitter
+
+function emitModuleEvent(courseKey, data) {
+  moduleEventBus.get(courseKey)?.emit('update', data);
+}
+
+// ════════════════════════════════════════════════════════════════
+//  CACHE HELPERS (Supabase chapter_cache table)
+// ════════════════════════════════════════════════════════════════
+
+function moduleListKey(subject, cls, chapter) {
+  const safe = s => s.replace(/[^a-zA-Z0-9]/g, '').toLowerCase().slice(0, 20);
+  return `bscm-list-${safe(subject)}-${safe(cls)}-${safe(chapter)}`;
+}
+
+function moduleContentKey(subject, cls, chapter, moduleId) {
+  const safe = s => s.replace(/[^a-zA-Z0-9]/g, '').toLowerCase().slice(0, 16);
+  return `bscm-mod-${safe(subject)}-${safe(cls)}-${safe(chapter)}-${moduleId}`;
+}
+
+async function getCacheEntry(key) {
+  try {
+    const { data } = await db.from('chapter_cache').select('*').eq('cache_key', key).maybeSingle();
+    return data || null;
+  } catch { return null; }
+}
+
+async function setCacheEntry(key, payload, meta = {}) {
+  try {
+    await db.from('chapter_cache').upsert({
+      cache_key: key,
+      notes:     JSON.stringify(payload), // reuse notes column for JSON blobs
+      subject:   meta.subject || '',
+      class_level: meta.cls || '',
+      chapter:   meta.chapter || '',
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'cache_key' });
+  } catch (e) { console.error('[setCacheEntry]', e.message); }
+}
+
+// ════════════════════════════════════════════════════════════════
+//  MODULE COUNT based on role
+// ════════════════════════════════════════════════════════════════
+function getModuleCount(user) {
+  // Teachers / pro: 12 modules; Students: 10
+  if (user.role === 'teacher') return 12;
+  if (user.subscription_status === 'active') return 12;
+  return 10;
+}
+
+// ════════════════════════════════════════════════════════════════
+//  ROUTES
+// ════════════════════════════════════════════════════════════════
+
+/**
+ * GET /api/chapter-courses/list/:key
+ * Returns the cached module list for a chapter (or null if not generated yet).
+ */
+app.get('/api/chapter-courses/list/:key', async (req, res) => {
+  const entry = await getCacheEntry(req.params.key);
+  if (!entry) return res.json(null);
+  try { res.json(JSON.parse(entry.notes)); }
+  catch { res.json(null); }
+});
+
+/**
+ * GET /api/chapter-courses/module/:key
+ * Returns cached content for a single module (or null).
+ */
+app.get('/api/chapter-courses/module/:key', async (req, res) => {
+  const entry = await getCacheEntry(req.params.key);
+  if (!entry) return res.json(null);
+  try { res.json(JSON.parse(entry.notes)); }
+  catch { res.json(null); }
+});
+
+/**
+ * POST /api/chapter-courses/generate
+ * Starts background generation of ALL modules for a chapter.
+ * Returns immediately with { courseKey, existing: bool }
+ * Frontend should then connect to SSE stream.
+ */
+app.post('/api/chapter-courses/generate', verifyToken, checkAccess, async (req, res) => {
+  const { subject, cls, chapter } = req.body;
+  if (!subject || !cls || !chapter)
+    return res.status(400).json({ error: 'subject, cls, chapter required' });
+
+  const listKey = moduleListKey(subject, cls, chapter);
+
+  // Return existing if already generated
+  const existing = await getCacheEntry(listKey);
+  if (existing) {
+    try {
+      const parsed = JSON.parse(existing.notes);
+      if (parsed?.modules?.length) return res.json({ courseKey: listKey, existing: true });
+    } catch {}
+  }
+
+  // Start generation in background
+  res.json({ courseKey: listKey, existing: false });
+
+  const moduleCount = getModuleCount(req.user);
+  generateChapterCourse(listKey, subject, cls, chapter, moduleCount, req.user.id).catch(e =>
+    console.error('[generateChapterCourse]', e.message)
+  );
+});
+
+/**
+ * GET /api/chapter-courses/stream/:key
+ * SSE endpoint for real-time generation progress.
+ * Query param: token=<jwt>  (for SSE which can't set Authorization header)
+ */
+app.get('/api/chapter-courses/stream/:key', async (req, res) => {
+  // Auth via query param for SSE
+  const token = req.headers.authorization?.slice(7) || req.query.token;
+  if (!token) return res.status(401).json({ error: 'token required' });
+  try { jwt.verify(token, process.env.JWT_SECRET); }
+  catch { return res.status(401).json({ error: 'invalid token' }); }
+
+  res.setHeader('Content-Type',  'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection',    'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+
+  const courseKey = req.params.key;
+  const send      = data => res.write(`data: ${JSON.stringify(data)}\n\n`);
+  const keepAlive = setInterval(() => res.write(': ping\n\n'), 20000);
+  const emitter   = moduleEventBus.get(courseKey);
+
+  send({ type: 'connected' });
+
+  if (!emitter) {
+    // Check if already done
+    const cached = await getCacheEntry(courseKey);
+    if (cached) {
+      try { send({ type: 'already_done', data: JSON.parse(cached.notes) }); }
+      catch {}
+    } else {
+      send({ type: 'no_stream' });
+    }
+    clearInterval(keepAlive);
+    return res.end();
+  }
+
+  emitter.on('update', send);
+  req.on('close', () => {
+    clearInterval(keepAlive);
+    emitter.off('update', send);
+  });
+});
+
+/**
+ * POST /api/chapter-courses/module/regenerate
+ * Regenerates content for a single module (e.g. after swapping video).
+ */
+app.post('/api/chapter-courses/module/regenerate', verifyToken, checkAccess, async (req, res) => {
+  const { subject, cls, chapter, moduleId, videoId, moduleTitle, searchQuery } = req.body;
+  if (!subject || !cls || !chapter || moduleId === undefined)
+    return res.status(400).json({ error: 'subject, cls, chapter, moduleId required' });
+
+  const modKey = moduleContentKey(subject, cls, chapter, moduleId);
+  res.json({ ok: true, modKey });
+
+  // Background: fetch transcript for new video, regenerate content
+  (async () => {
+    try {
+      let transcript = null;
+      if (videoId) {
+        transcript = await ytTranscript(videoId);
+      } else if (searchQuery) {
+        const videos = await ytSearch(`${searchQuery} ${subject} ${cls} CBSE`, 5);
+        const best   = await getBestTranscript(videos);
+        transcript = best.transcript;
+      }
+
+      const content = await aiGenerateModuleContent(
+        moduleTitle || `Module ${moduleId}`, chapter, subject, cls, transcript
+      );
+
+      // Get existing module data and merge
+      const existing = await getCacheEntry(modKey);
+      let modData = {};
+      try { modData = JSON.parse(existing?.notes || '{}'); } catch {}
+
+      await setCacheEntry(modKey, {
+        ...modData,
+        notes:      content.notes,
+        qa:         content.qa,
+        quiz:       content.quiz,
+        transcript: transcript || null,
+        transcriptStatus: transcript ? 'success' : 'unavailable',
+        videoId:    videoId || modData.videoId,
+      }, { subject, cls, chapter });
+    } catch (e) {
+      console.error('[module regenerate]', e.message);
+    }
+  })();
+});
+
+/**
+ * PATCH /api/chapter-courses/module/video
+ * Swap to a different video for a module — triggers transcript fetch + content regen.
+ * Returns new search results for the module.
+ */
+app.patch('/api/chapter-courses/module/video', verifyToken, async (req, res) => {
+  const { subject, cls, chapter, moduleId, newVideoId, moduleTitle } = req.body;
+  if (!subject || !cls || !chapter || moduleId === undefined || !newVideoId)
+    return res.status(400).json({ error: 'Missing required fields' });
+
+  const modKey = moduleContentKey(subject, cls, chapter, moduleId);
+
+  // Update videoId immediately for UX
+  const existing = await getCacheEntry(modKey);
+  let modData = {};
+  try { modData = JSON.parse(existing?.notes || '{}'); } catch {}
+
+  await setCacheEntry(modKey, {
+    ...modData,
+    videoId: newVideoId,
+    transcriptStatus: 'pending',
+  }, { subject, cls, chapter });
+
+  res.json({ ok: true, videoId: newVideoId });
+
+  // Background: fetch transcript + regenerate
+  (async () => {
+    try {
+      const transcript = await ytTranscript(newVideoId);
+      const content    = await aiGenerateModuleContent(
+        moduleTitle || `Module ${moduleId}`, chapter, subject, cls, transcript
+      );
+      await setCacheEntry(modKey, {
+        ...modData,
+        videoId:          newVideoId,
+        notes:            content.notes,
+        qa:               content.qa,
+        quiz:             content.quiz,
+        transcript:       transcript || null,
+        transcriptStatus: transcript ? 'success' : 'unavailable',
+      }, { subject, cls, chapter });
+    } catch (e) {
+      console.error('[swap video regen]', e.message);
+    }
+  })();
+});
+
+// ════════════════════════════════════════════════════════════════
+//  BACKGROUND GENERATION ENGINE
+// ════════════════════════════════════════════════════════════════
+async function generateChapterCourse(listKey, subject, cls, chapter, moduleCount, userId) {
+  const emitter = new EventEmitter();
+  emitter.setMaxListeners(100);
+  moduleEventBus.set(listKey, emitter);
+
+  const emit = data => emitter.emit('update', data);
+
+  try {
+    // ── Step 1: Generate module structure ────────────────────
+    emit({ type: 'status', message: `Designing ${moduleCount} modules for "${chapter}"…` });
+
+    const modules = await aiGenerateModuleList(subject, cls, chapter, moduleCount);
+    if (!modules?.length) throw new Error('Module generation failed');
+
+    // Save module list skeleton immediately (no content yet)
+    const skeleton = modules.map(m => ({
+      ...m,
+      status: 'pending',  // pending | building | done | error
+      videoId: null,
+      videoTitle: null,
+      videoChannel: null,
+      videoThumbnail: null,
+      searchResults: [],
+    }));
+
+    await setCacheEntry(listKey, { modules: skeleton, generatedAt: new Date().toISOString() }, { subject, cls, chapter });
+    emit({ type: 'modules_listed', modules: skeleton });
+
+    // ── Step 2: Process each module sequentially ──────────────
+    // Sequential gives better quality (no rate-limit collisions)
+    for (const mod of modules) {
+      const modKey = moduleContentKey(subject, cls, chapter, mod.id);
+      emit({ type: 'module_building', moduleId: mod.id, title: mod.title });
+
+      try {
+        // Search YouTube
+        const searchQ = `${mod.searchQuery || mod.title} ${subject} ${cls} CBSE explained`;
+        const videos  = await ytSearch(searchQ, 5);
+
+        // Get best transcript
+        const { transcript, videoId: bestVidId } = await getBestTranscript(videos);
+        const topVideo = videos.find(v => v.videoId === bestVidId) || videos[0] || null;
+
+        // Generate content
+        const content = await aiGenerateModuleContent(
+          mod.title, chapter, subject, cls, transcript
+        );
+
+        // Cache module content
+        const modData = {
+          moduleId:        mod.id,
+          title:           mod.title,
+          description:     mod.description,
+          emoji:           mod.emoji,
+          estimatedMinutes: mod.estimatedMinutes,
+          keyTopics:       mod.keyTopics,
+          videoId:         bestVidId || null,
+          videoTitle:      topVideo?.title || null,
+          videoChannel:    topVideo?.channel || null,
+          videoThumbnail:  topVideo?.thumbnail || null,
+          searchResults:   videos,
+          transcript:      transcript || null,
+          transcriptStatus: transcript ? 'success' : bestVidId ? 'unavailable' : 'none',
+          notes:           content.notes,
+          qa:              content.qa,
+          quiz:            content.quiz,
+          generatedAt:     new Date().toISOString(),
+        };
+        await setCacheEntry(modKey, modData, { subject, cls, chapter });
+
+        // Update skeleton with video info
+        skeleton[mod.id - 1] = {
+          ...skeleton[mod.id - 1],
+          status:          'done',
+          videoId:         bestVidId || null,
+          videoTitle:      topVideo?.title || null,
+          videoChannel:    topVideo?.channel || null,
+          videoThumbnail:  topVideo?.thumbnail || null,
+          transcriptStatus: modData.transcriptStatus,
+        };
+        await setCacheEntry(listKey, { modules: skeleton, generatedAt: new Date().toISOString() }, { subject, cls, chapter });
+
+        emit({ type: 'module_done', moduleId: mod.id, videoId: bestVidId, transcriptStatus: modData.transcriptStatus });
+
+        // Brief pause to avoid rate limits
+        await new Promise(r => setTimeout(r, 800));
+
+      } catch (e) {
+        console.error(`[module ${mod.id} error]`, e.message);
+        skeleton[mod.id - 1].status = 'error';
+        await setCacheEntry(listKey, { modules: skeleton, generatedAt: new Date().toISOString() }, { subject, cls, chapter });
+        emit({ type: 'module_error', moduleId: mod.id });
+      }
+    }
+
+    emit({ type: 'generation_complete', modules: skeleton });
+    logActivity(userId, 'notes', { subject, chapter, xpEarned: 30 }).catch(() => {});
+
+  } catch (e) {
+    console.error('[generateChapterCourse]', e.message);
+    emit({ type: 'error', message: e.message });
+  } finally {
+    // Clean up emitter after 3 minutes
+    setTimeout(() => moduleEventBus.delete(listKey), 3 * 60 * 1000);
+  }
+}
+// ═══════════ END OF MODULE COURSE ADDITIONS ═══════════════════
+
 
 // ════════════════════════════════════════════════════════════════
 //  HEALTH CHECK
