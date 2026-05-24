@@ -150,7 +150,7 @@ async function callAI(messages, system = '', maxTokens = 2000, tool = 'default')
       role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content,
     })));
     const r = await groq.chat.completions.create({
-      model: 'llama3-70b-8192', max_tokens: Math.min(maxTokens, 4096), messages: msgs,
+      model: 'llama-3.3-70b-versatile', max_tokens: Math.min(maxTokens, 4096), messages: msgs,
     });
     return { text: r.choices[0].message.content.trim(), provider: 'groq' };
   }
