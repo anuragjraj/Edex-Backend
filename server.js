@@ -32,7 +32,13 @@ const crypto           = require('crypto');
 const multer           = require('multer');
 const csv              = require('csv-parser');
 const stream           = require('stream');
-const { YoutubeTranscript } = require('youtube-transcript');
+let YoutubeTranscript;
+try {
+  ({ YoutubeTranscript } = require('youtube-transcript'));
+} catch (e) {
+  console.warn('[youtube-transcript] package not found — transcript features disabled');
+  YoutubeTranscript = null;
+}
 require('dotenv').config();
 
 // ════════════════════════════════════════════════════════════════
@@ -558,6 +564,17 @@ app.get('/api/user/stats', verifyToken, async (req, res) => {
       .eq('user_id', req.user.id).gte('created_at', sevenAgo);
     res.json({ stats: stats?.[0] || {}, recentActivity: recent || [], weeklyActivity: weekly || [] });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/user/history', verifyToken, async (req, res) => {
+  const page  = parseInt(req.query.page) || 1;
+  const limit = 50;
+  const { data } = await db.from('activity_log')
+    .select('id, tool, subject, chapter, chapters, xp_earned, ai_provider, created_at')
+    .eq('user_id', req.user.id)
+    .order('created_at', { ascending: false })
+    .range((page - 1) * limit, page * limit - 1);
+  res.json(data || []);
 });
 
 app.get('/api/user/achievements', verifyToken, async (req, res) => {
@@ -1527,13 +1544,11 @@ async function ytSearch(query, n = 5) {
  * Trims to maxChars to stay within Claude context limits.
  */
 async function ytTranscript(videoId, maxChars = 8000) {
-  if (!videoId) return null;
+  if (!videoId || !YoutubeTranscript) return null;
   try {
-    // Try English first, then any language
     let segs;
     try { segs = await YoutubeTranscript.fetchTranscript(videoId, { lang: 'en' }); }
     catch { segs = await YoutubeTranscript.fetchTranscript(videoId); }
-
     if (!segs?.length) return null;
     const text = segs.map(s => s.text).join(' ').replace(/\s+/g, ' ').trim();
     return text.length > 200 ? text.slice(0, maxChars) : null;
