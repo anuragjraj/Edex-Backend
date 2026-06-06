@@ -1714,6 +1714,7 @@ function getModuleCount(user) {
  * Returns the cached module list for a chapter (or null if not generated yet).
  */
 app.get('/api/chapter-courses/list/:key', async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store')
   const entry = await getCacheEntry(req.params.key);
   if (!entry) return res.json(null);
   try {
@@ -1828,13 +1829,29 @@ app.post('/api/chapter-courses/generate', verifyToken, checkAccess, async (req, 
 
   // Return existing if already generated
   const existing = await getCacheEntry(listKey);
-  if (existing) {
-    try {
-      const parsed = JSON.parse(existing.notes);
-      if (parsed?.modules?.length) return res.json({ courseKey: listKey, existing: true });
-    } catch {}
-  }
-
+if (existing) {
+  try {
+    const parsed = JSON.parse(existing.notes);
+    if (parsed?.modules?.length) {
+      const doneCount = parsed.modules.filter(m => m.status === 'done').length;
+      const totalCount = parsed.modules.length;
+      
+      // Course is complete — return as-is
+      if (doneCount === totalCount) {
+        return res.json({ courseKey: listKey, existing: true });
+      }
+      
+      // Course is incomplete — return existing and resume generation for missing modules
+      res.json({ courseKey: listKey, existing: true, resuming: true });
+      
+      // Resume only the pending/error modules in background
+      resumeChapterCourse(listKey, subject, cls, chapter, parsed.modules, req.user.id).catch(e =>
+        console.error('[resumeChapterCourse]', e.message)
+      );
+      return;
+    }
+  } catch {}
+}
   // Start generation in background
   res.json({ courseKey: listKey, existing: false });
 
@@ -2092,6 +2109,90 @@ async function generateChapterCourse(listKey, subject, cls, chapter, moduleCount
     // Clean up emitter after 3 minutes
     setTimeout(() => moduleEventBus.delete(listKey), 3 * 60 * 1000);
   }
+}
+
+async function resumeChapterCourse(listKey, subject, cls, chapter, existingModules, userId) {
+  const emitter = new EventEmitter();
+  emitter.setMaxListeners(100);
+  moduleEventBus.set(listKey, emitter);
+
+  const emit = data => emitter.emit('update', data);
+  const skeleton = [...existingModules];
+
+  // Find modules that need to be built
+  const pending = existingModules.filter(m => m.status !== 'done');
+
+  if (pending.length === 0) {
+    emit({ type: 'generation_complete', modules: skeleton });
+    return;
+  }
+
+  emit({ type: 'status', message: `Resuming — building ${pending.length} remaining modules…` });
+  emit({ type: 'modules_listed', modules: skeleton });
+
+  for (const mod of pending) {
+    const modKey = moduleContentKey(subject, cls, chapter, mod.id);
+    emit({ type: 'module_building', moduleId: mod.id, title: mod.title });
+
+    try {
+      const searchQ = `${mod.searchQuery || mod.title} ${subject} ${cls} CBSE explained`;
+      const videos  = await ytSearch(searchQ, 5);
+      const { transcript, videoId: bestVidId } = await getBestTranscript(videos);
+      const topVideo = videos.find(v => v.videoId === bestVidId) || videos[0] || null;
+
+      const content = await aiGenerateModuleContent(
+        mod.title, chapter, subject, cls, transcript
+      );
+
+      const modData = {
+        moduleId:         mod.id,
+        title:            mod.title,
+        description:      mod.description,
+        emoji:            mod.emoji,
+        estimatedMinutes: mod.estimatedMinutes,
+        keyTopics:        mod.keyTopics,
+        videoId:          bestVidId || null,
+        videoTitle:       topVideo?.title || null,
+        videoChannel:     topVideo?.channel || null,
+        videoThumbnail:   topVideo?.thumbnail || null,
+        searchResults:    videos,
+        transcript:       transcript || null,
+        transcriptStatus: transcript ? 'success' : bestVidId ? 'unavailable' : 'none',
+        notes:            content.notes,
+        qa:               content.qa,
+        quiz:             content.quiz,
+        generatedAt:      new Date().toISOString(),
+      };
+      await setCacheEntry(modKey, modData, { subject, cls, chapter });
+
+      // Update skeleton
+      const idx = skeleton.findIndex(m => m.id === mod.id);
+      if (idx > -1) {
+        skeleton[idx] = {
+          ...skeleton[idx],
+          status:           'done',
+          videoId:          bestVidId || null,
+          videoTitle:       topVideo?.title || null,
+          videoChannel:     topVideo?.channel || null,
+          videoThumbnail:   topVideo?.thumbnail || null,
+          transcriptStatus: modData.transcriptStatus,
+        };
+        await setCacheEntry(listKey, { modules: skeleton, generatedAt: new Date().toISOString() }, { subject, cls, chapter });
+      }
+
+      emit({ type: 'module_done', moduleId: mod.id, videoId: bestVidId, transcriptStatus: modData.transcriptStatus });
+      await new Promise(r => setTimeout(r, 800));
+
+    } catch (e) {
+      console.error(`[resume module ${mod.id} error]`, e.message);
+      skeleton[skeleton.findIndex(m => m.id === mod.id)].status = 'error';
+      await setCacheEntry(listKey, { modules: skeleton, generatedAt: new Date().toISOString() }, { subject, cls, chapter });
+      emit({ type: 'module_error', moduleId: mod.id });
+    }
+  }
+
+  emit({ type: 'generation_complete', modules: skeleton });
+  setTimeout(() => moduleEventBus.delete(listKey), 3 * 60 * 1000);
 }
 // ═══════════ END OF MODULE COURSE ADDITIONS ═══════════════════
 
