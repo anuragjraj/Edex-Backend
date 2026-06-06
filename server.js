@@ -1781,7 +1781,7 @@ app.post('/api/chapter-courses/module/retry', verifyToken, checkAccess, async (r
       }, { subject, cls, chapter });
 
       // Update module status in list cache to 'done'
-      const listEntry = await git addgetCacheEntry(listKey);
+      const listEntry = await getCacheEntry(listKey);
       if (listEntry) {
         const parsed = JSON.parse(listEntry.notes);
         const idx = parsed.modules.findIndex(m => m.id === moduleId);
