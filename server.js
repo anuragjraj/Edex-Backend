@@ -1829,29 +1829,32 @@ app.post('/api/chapter-courses/generate', verifyToken, checkAccess, async (req, 
 
   // Return existing if already generated
   const existing = await getCacheEntry(listKey);
-if (existing) {
-  try {
-    const parsed = JSON.parse(existing.notes);
-    if (parsed?.modules?.length) {
-      const doneCount = parsed.modules.filter(m => m.status === 'done').length;
-      const totalCount = parsed.modules.length;
-      
-      // Course is complete — return as-is
-      if (doneCount === totalCount) {
-        return res.json({ courseKey: listKey, existing: true });
+  if (existing) {
+    try {
+      const parsed = JSON.parse(existing.notes);
+      if (parsed?.modules?.length) {
+
+        // ✅ FIX 3: treat 'done' modules with no videoId as needing retry too
+        const needsWork = parsed.modules.filter(m =>
+          m.status !== 'done' ||
+          (!m.videoId && m.transcriptStatus !== 'none')  // done but missing video
+        )
+
+        if (needsWork.length === 0) {
+          return res.json({ courseKey: listKey, existing: true })
+        }
+
+        // Return existing immediately, resume in background
+        res.json({ courseKey: listKey, existing: true, resuming: true })
+
+        // ✅ Pass the full modules list; resumeChapterCourse will filter to only pending/error/broken
+        resumeChapterCourse(listKey, subject, cls, chapter, parsed.modules, req.user.id).catch(e =>
+          console.error('[resumeChapterCourse]', e.message)
+        )
+        return
       }
-      
-      // Course is incomplete — return existing and resume generation for missing modules
-      res.json({ courseKey: listKey, existing: true, resuming: true });
-      
-      // Resume only the pending/error modules in background
-      resumeChapterCourse(listKey, subject, cls, chapter, parsed.modules, req.user.id).catch(e =>
-        console.error('[resumeChapterCourse]', e.message)
-      );
-      return;
-    }
-  } catch {}
-}
+    } catch {}
+  }
   // Start generation in background
   res.json({ courseKey: listKey, existing: false });
 
@@ -2120,7 +2123,10 @@ async function resumeChapterCourse(listKey, subject, cls, chapter, existingModul
   const skeleton = [...existingModules];
 
   // Find modules that need to be built
-  const pending = existingModules.filter(m => m.status !== 'done');
+  const pending = existingModules.filter(m =>
+  m.status !== 'done' ||
+  (!m.videoId && m.transcriptStatus !== 'none')
+)
 
   if (pending.length === 0) {
     emit({ type: 'generation_complete', modules: skeleton });
