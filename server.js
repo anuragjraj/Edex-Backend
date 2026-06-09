@@ -1835,27 +1835,7 @@ app.get('/api/chapter-courses/list/:key', async (req, res) => {
   const entry = await getCacheEntry(req.params.key);
   if (!entry) return res.json(null);
   try {
-    const parsed = JSON.parse(entry.notes);
-    
-    // Check if any modules need reprocessing
-    const modules = parsed?.modules || [];
-    const hasProblems = modules.some(m => 
-      m.status === 'error' || 
-      m.status === 'pending' ||
-      (m.status === 'done' && (!m.videoId || !m.transcriptStatus))
-    );
-    
-    // If more than 30% modules are broken, invalidate entire cache
-    const brokenCount = modules.filter(m => 
-      m.status === 'error' || m.status === 'pending'
-    ).length;
-    
-    if (brokenCount > modules.length * 0.3) {
-      await db.from('chapter_cache').delete().eq('cache_key', req.params.key);
-      return res.json(null); // Forces full regeneration
-    }
-    
-    res.json(parsed);
+    res.json(JSON.parse(entry.notes));
   } catch { res.json(null); }
 });
 
@@ -1971,6 +1951,9 @@ app.post('/api/chapter-courses/generate', verifyToken, checkAccess, async (req, 
 
         // Return existing immediately, resume in background
         res.json({ courseKey: listKey, existing: true, resuming: true })
+
+        // If a generator is already running for this course, don't start a second one
+        if (moduleEventBus.has(listKey)) return
 
         // ✅ Pass the full modules list; resumeChapterCourse will filter to only pending/error/broken
         resumeChapterCourse(listKey, subject, cls, chapter, parsed.modules, req.user.id).catch(e =>
