@@ -1525,6 +1525,29 @@ function indicRatio(str = '') {
   return total ? indic / total : 0;
 }
 
+// Regional-language names that signal a non-English video (even in Latin script)
+const REGIONAL_LANG_WORDS = /\b(hindi|hinglish|malayalam|tamil|telugu|kannada|bengali|bangla|marathi|gujarati|punjabi|urdu|odia|oriya|assamese|sanskrit|bhojpuri)\b/i;
+// Audio-language codes to reject
+const NON_EN_AUDIO = new Set(['hi','ml','ta','te','kn','bn','mr','gu','pa','ur','or','as','sa','ne','si']);
+
+function isNonEnglishVideo(v) {
+  const meta  = v.meta || {};
+  const title = v.title || '';
+  const desc  = v.description || '';
+
+  // 1) explicit audio-language tag from the API
+  if (meta.audioLang) {
+    const base = meta.audioLang.split('-')[0];
+    if (NON_EN_AUDIO.has(base)) return true;
+  }
+  // 2) regional language named in title or description (catches Latin-script titles)
+  if (REGIONAL_LANG_WORDS.test(title) || REGIONAL_LANG_WORDS.test(desc)) return true;
+  // 3) significant non-Latin (Indic) script in the title
+  if (indicRatio(title) > 0.10) return true;
+
+  return false;
+}
+
 async function enrichVideoMetadata(videoIds) {
   const out = {};
   if (!process.env.YOUTUBE_API_KEY || !videoIds.length) return out;
@@ -1606,17 +1629,16 @@ async function ytSearchRanked(query, ctx = {}, n = 12) {
 async function pickModuleVideo(query, ctx, n = 15) {
   const ranked = await ytSearchRanked(query, ctx, n);
 
-  // Only unused videos are eligible — never repeat within a chapter
-  let pool = ranked.filter(v => !ctx.usedVideoIds?.has(v.videoId));
+  // Only unused AND English videos are eligible
+  let pool = ranked.filter(v => !ctx.usedVideoIds?.has(v.videoId) && !isNonEnglishVideo(v));
 
-  // If everything in this search was already used, widen with an alt query once
+  // If nothing English/fresh, widen the search once with an explicitly English query
   if (!pool.length) {
-    const alt = await ytSearchRanked(`${query} lesson tutorial`, ctx, n);
-    pool = alt.filter(v => !ctx.usedVideoIds?.has(v.videoId));
+    const alt = await ytSearchRanked(`${query} in English explanation`, ctx, n);
+    pool = alt.filter(v => !ctx.usedVideoIds?.has(v.videoId) && !isNonEnglishVideo(v));
   }
 
-  // Still nothing fresh → no video for this module (notes come from AI knowledge).
-  // We intentionally do NOT reuse a video.
+  // Still nothing English → no video for this module (notes come from AI knowledge).
   if (!pool.length) return { video: null, videoId: null, transcript: null, candidates: [] };
 
   for (const v of pool.slice(0, 6)) {
