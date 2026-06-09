@@ -1626,22 +1626,50 @@ async function ytSearchRanked(query, ctx = {}, n = 12) {
   return scored;
 }
 
-async function pickModuleVideo(query, ctx, n = 15) {
-  const ranked = await ytSearchRanked(query, ctx, n);
+async function pickModuleVideo(query, ctx, n = 25) {
+  const perQuery = Math.min(Math.max(n, 25), 50); // YouTube allows up to 50
 
-  // Only unused AND English videos are eligible
-  let pool = ranked.filter(v => !ctx.usedVideoIds?.has(v.videoId) && !isNonEnglishVideo(v));
+  const kw = (ctx.keywords && ctx.keywords[0]) || '';
+  const queries = [
+    query,
+    `${query} explanation`,
+    `${query} in English lecture`,
+    `${ctx.subject} ${ctx.cls} ${kw} English`.trim(),
+  ];
 
-  // If nothing English/fresh, widen the search once with an explicitly English query
-  if (!pool.length) {
-    const alt = await ytSearchRanked(`${query} in English explanation`, ctx, n);
-    pool = alt.filter(v => !ctx.usedVideoIds?.has(v.videoId) && !isNonEnglishVideo(v));
+  let pool = [];
+  for (const q of queries) {
+    const ranked = await ytSearchRanked(q, ctx, perQuery);
+    const fresh = ranked.filter(v =>
+      v.videoId &&
+      !ctx.usedVideoIds?.has(v.videoId) &&
+      !pool.some(p => p.videoId === v.videoId) &&
+      !isNonEnglishVideo(v)
+    );
+    pool.push(...fresh);
+    if (pool.length >= 6) break;
   }
 
-  // Still nothing English → no video for this module (notes come from AI knowledge).
+  // ▼▼▼ INSERT THE LAST-RESORT BLOCK HERE ▼▼▼
+  // Absolute last resort: reuse a previously-used English video rather than leave the module blank
+  if (!pool.length) {
+    for (const q of queries) {
+      const ranked = await ytSearchRanked(q, ctx, perQuery);
+      const eng = ranked.filter(v => v.videoId && !isNonEnglishVideo(v)); // English, repeats allowed
+      if (eng.length) {
+        eng.sort((a, b) => (b._score || 0) - (a._score || 0));
+        pool = eng;
+        break;
+      }
+    }
+  }
+  // ▲▲▲ END OF INSERTED BLOCK ▲▲▲
+
   if (!pool.length) return { video: null, videoId: null, transcript: null, candidates: [] };
 
-  for (const v of pool.slice(0, 6)) {
+  pool.sort((a, b) => (b._score || 0) - (a._score || 0));
+
+  for (const v of pool.slice(0, 8)) {
     const t = await ytTranscript(v.videoId);
     if (t && t.length >= 500) return { video: v, videoId: v.videoId, transcript: t, candidates: pool };
   }
