@@ -1663,6 +1663,12 @@ async function pickModuleVideo(query, ctx, n = 25) {
     pool.sort((a, b) => (b._score || 0) - (a._score || 0));
   }
 
+  if (!pool.length && allRanked.length) {
+    const seen = new Set();
+    pool = allRanked.filter(v => v.videoId && !seen.has(v.videoId) && seen.add(v.videoId));
+    pool.sort((a, b) => (b._score || 0) - (a._score || 0));
+  }
+
   if (!pool.length) return { video: null, videoId: null, transcript: null, candidates: [] };
 
   pool.sort((a, b) => (b._score || 0) - (a._score || 0));
@@ -1989,8 +1995,7 @@ app.post('/api/chapter-courses/generate', verifyToken, checkAccess, async (req, 
 
         // ✅ FIX 3: treat 'done' modules with no videoId as needing retry too
         const needsWork = parsed.modules.filter(m =>
-          m.status !== 'done' ||
-          (!m.videoId && m.transcriptStatus !== 'none')  // done but missing video
+          m.status !== 'done' || !m.videoId
         )
 
         if (needsWork.length === 0) {
@@ -2281,10 +2286,8 @@ async function resumeChapterCourse(listKey, subject, cls, chapter, existingModul
 
   // Find modules that need to be built
   const pending = existingModules.filter(m =>
-  m.status !== 'done' ||
-  (!m.videoId && m.transcriptStatus !== 'none')
-)
-
+    m.status !== 'done' || !m.videoId
+  )
   if (pending.length === 0) {
     emit({ type: 'generation_complete', modules: skeleton });
     return;
