@@ -1603,16 +1603,28 @@ async function ytSearchRanked(query, ctx = {}, n = 12) {
   return scored;
 }
 
-async function pickModuleVideo(query, ctx, n = 12) {
+async function pickModuleVideo(query, ctx, n = 15) {
   const ranked = await ytSearchRanked(query, ctx, n);
+
+  // Only unused videos are eligible — never repeat within a chapter
   let pool = ranked.filter(v => !ctx.usedVideoIds?.has(v.videoId));
-  if (!pool.length) pool = ranked;
+
+  // If everything in this search was already used, widen with an alt query once
+  if (!pool.length) {
+    const alt = await ytSearchRanked(`${query} lesson tutorial`, ctx, n);
+    pool = alt.filter(v => !ctx.usedVideoIds?.has(v.videoId));
+  }
+
+  // Still nothing fresh → no video for this module (notes come from AI knowledge).
+  // We intentionally do NOT reuse a video.
+  if (!pool.length) return { video: null, videoId: null, transcript: null, candidates: [] };
+
   for (const v of pool.slice(0, 6)) {
     const t = await ytTranscript(v.videoId);
     if (t && t.length >= 500) return { video: v, videoId: v.videoId, transcript: t, candidates: pool };
   }
-  const top = pool[0] || null;
-  return { video: top, videoId: top?.videoId || null, transcript: null, candidates: pool };
+  const top = pool[0];
+  return { video: top, videoId: top.videoId, transcript: null, candidates: pool };
 }
 
 async function ytSearch(query, n = 5) {
