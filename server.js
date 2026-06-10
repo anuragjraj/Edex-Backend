@@ -571,7 +571,7 @@ app.get('/api/user/history', verifyToken, async (req, res) => {
   const page  = parseInt(req.query.page) || 1;
   const limit = 50;
   const { data } = await db.from('activity_log')
-    .select('id, tool, subject, chapter, chapters, xp_earned, ai_provider, created_at')
+    .select('id, tool, subject, chapter, chapters, xp_earned, ai_provider, metadata, created_at')
     .eq('user_id', req.user.id)
     .order('created_at', { ascending: false })
     .range((page - 1) * limit, page * limit - 1);
@@ -2374,7 +2374,7 @@ async function generateChapterCourse(listKey, subject, cls, chapter, moduleCount
     }
 
     emit({ type: 'generation_complete', modules: skeleton });
-    logActivity(userId, 'notes', { subject, chapter, xpEarned: 30 }).catch(() => {});
+    logActivity(userId, 'courses', { subject, chapter, xpEarned: 30, meta: { cls } }).catch(() => {});
 
   } catch (e) {
     console.error('[generateChapterCourse]', e.message);
