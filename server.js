@@ -106,15 +106,15 @@ const MODEL_TIER = {
   doubt:      'claude-haiku-4-5-20251001',
   flashcards: 'claude-haiku-4-5-20251001',
   buddy:      'claude-haiku-4-5-20251001',
-  quiz:       'claude-sonnet-4-6',
-  notes:      'claude-sonnet-4-6',
-  paper:      'claude-sonnet-4-6',
-  cheatsheet: 'claude-sonnet-4-6',
-  lessonplan: 'claude-sonnet-4-6',
+  quiz:       'claude-haiku-4-5-20251001',
+  notes:      'claude-haiku-4-5-20251001',
+  paper:      'claude-haiku-4-5-20251001',
+  cheatsheet: 'claude-haiku-4-5-20251001',
+  lessonplan: 'claude-haiku-4-5-20251001',
 };
 
 async function callAI(messages, system = '', maxTokens = 2000, tool = 'default') {
-  const claudeModel = MODEL_TIER[tool] || 'claude-sonnet-4-6';
+  const claudeModel = MODEL_TIER[tool] || 'claude-haiku-4-5-20251001';
 
   // 1. Try Anthropic (Claude) — primary
   try {
