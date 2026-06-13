@@ -1411,6 +1411,17 @@ const AI_CONFIGS = {
 };
 
 const MATH_SUBJECTS = ['Mathematics', 'Physics', 'Chemistry'];
+// Only these tools actually benefit from exact compute verification.
+// Notes / cheatsheet / lessonplan are prose-heavy and must NOT hard-fail when compute is down.
+const MATH_TOOLS = new Set(['quiz', 'paper']);
+
+// Detects the math-engine "compute unavailable" refusal so we can fall back
+const isComputeRefusal = t =>
+  !t ||
+  /compute\s*(math\s*)?service is currently unavailable/i.test(t) ||
+  /pending tool verification/i.test(t) ||
+  /cannot responsibly publish/i.test(t);
+
 app.post('/api/ai/:tool', verifyToken, checkAccess, aiLimiter, async (req, res) => {
   const cfg = AI_CONFIGS[req.params.tool];
   if (!cfg) return res.status(400).json({ error: `Unknown tool: ${req.params.tool}` });
@@ -1420,15 +1431,33 @@ app.post('/api/ai/:tool', verifyToken, checkAccess, aiLimiter, async (req, res) 
       return res.status(400).json({ error: 'Messages array required' });
 
     let text, provider;
-    if (MATH_SUBJECTS.includes(subject)) {
+    const useMath = MATH_SUBJECTS.includes(subject) && MATH_TOOLS.has(req.params.tool);
+
+    if (useMath) {
       // exact-math path WITH full fallback (Claude → OpenAI → Groq), each with SymPy
-      const r = await callAIWithMath({ anthropic, openai, groq }, {
-        messages, system, maxTokens: cfg.maxTokens,
-      });
-      text = r.text; provider = r.provider;
+      try {
+        const r = await callAIWithMath({ anthropic, openai, groq }, {
+          messages, system, maxTokens: cfg.maxTokens,
+        });
+        text = r.text; provider = r.provider;
+        // If the engine refused because compute was down, degrade to normal generation
+        if (isComputeRefusal(text)) {
+          console.warn('[math engine returned a compute-unavailable refusal — falling back to callAI]');
+          ({ text, provider } = await callAI(messages, system, cfg.maxTokens, cfg.label));
+        }
+      } catch (e) {
+        console.warn('[math engine threw — falling back to callAI]', e.message?.slice(0, 120));
+        ({ text, provider } = await callAI(messages, system, cfg.maxTokens, cfg.label));
+      }
     } else {
-      // your original path, untouched
+      // plain generation path (now used for notes/cheatsheet/lessonplan/flashcards/doubt)
       ({ text, provider } = await callAI(messages, system, cfg.maxTokens, cfg.label));
+    }
+
+    // Final safety net: never return / save a refusal stub as if it were content
+    if (isComputeRefusal(text)) {
+      console.error(`[AI /${req.params.tool}] still a refusal after fallback — not saving`);
+      return res.status(503).json({ error: 'Generation service is busy. Please try again in a moment.' });
     }
 
     logActivity(req.user.id, cfg.label, { subject, chapter, chapters, xpEarned: cfg.xp, provider, meta: { subject, chapter } }).catch(console.error);
