@@ -48,6 +48,10 @@ require('dotenv').config();
 const app  = express();
 const PORT = process.env.PORT || 5000;
 
+// Render/Vercel/etc. sit behind a proxy — trust the first hop so
+// express-rate-limit can read the real client IP from X-Forwarded-For
+app.set('trust proxy', 1);
+
 app.use(helmet());
 app.use(morgan('dev'));
 app.use(cors({
