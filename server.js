@@ -631,6 +631,39 @@ app.get('/api/user/history', verifyToken, async (req, res) => {
   res.json(data || []);
 });
 
+
+// ── DOUBT THREAD (permanent, per-user) ──────────────────────────
+app.get('/api/doubt/thread', verifyToken, async (req, res) => {
+  const { data } = await db.from('doubt_messages')
+    .select('role, content, subject, chapter, ts')
+    .eq('user_id', req.user.id)
+    .order('ts', { ascending: true })   // oldest first → scroll up sees the start
+    .limit(1000);
+  res.json(data || []);
+});
+
+app.post('/api/doubt/thread', verifyToken, async (req, res) => {
+  const { messages } = req.body;
+  if (!Array.isArray(messages) || !messages.length)
+    return res.status(400).json({ error: 'messages array required' });
+  const rows = messages.map(m => ({
+    user_id: req.user.id,
+    role:    m.role === 'assistant' ? 'assistant' : 'user',
+    content: m.content,
+    subject: m.subject || '',
+    chapter: m.chapter || '',
+    ts:      m.ts ? new Date(m.ts).toISOString() : new Date().toISOString(),
+  }));
+  const { error } = await db.from('doubt_messages').insert(rows);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ ok: true });
+});
+
+app.delete('/api/doubt/thread', verifyToken, async (req, res) => {
+  await db.from('doubt_messages').delete().eq('user_id', req.user.id);
+  res.json({ ok: true });
+});
+
 app.get('/api/user/achievements', verifyToken, async (req, res) => {
   const { data: all } = await db.from('achievements').select('*').order('sort_order');
   const { data: unlocked } = await db.from('user_achievements').select('achievement_id, unlocked_at').eq('user_id', req.user.id);
