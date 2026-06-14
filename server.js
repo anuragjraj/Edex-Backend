@@ -1632,10 +1632,10 @@ app.get('/debug/profile/:userId', verifyToken, async (req, res) => {
 //  ROUTES: SUBSCRIPTION
 // ════════════════════════════════════════════════════════════════
 const PLANS = {
-  student_monthly:  { amount: 15000,  label: 'Student Monthly',  months: 1  },
-  student_yearly:   { amount: 150000, label: 'Student Yearly',   months: 12 },
-  teacher_monthly:  { amount: 18000,  label: 'Teacher Monthly',  months: 1  },
-  teacher_yearly:   { amount: 180000, label: 'Teacher Yearly',   months: 12 },
+  student_monthly:  { amount: 23000,  label: 'Student Monthly',  months: 1  },
+  student_yearly:   { amount: 222000, label: 'Student Yearly',   months: 12 },
+  teacher_monthly:  { amount: 30000,  label: 'Teacher Monthly',  months: 1  },
+  teacher_yearly:   { amount: 280000, label: 'Teacher Yearly',   months: 12 },
 };
 
 app.post('/api/subscription/create-order', verifyToken, async (req, res) => {
