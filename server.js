@@ -345,6 +345,53 @@ async function buildLoginResponse(user, deviceInfo = {}) {
 // ════════════════════════════════════════════════════════════════
 //  ROUTES: AUTH
 // ════════════════════════════════════════════════════════════════
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const otpLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, message: { error: 'Too many code requests. Please wait.' } });
+
+app.post('/api/auth/send-otp', otpLimiter, async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email || !EMAIL_RE.test(email)) return res.status(400).json({ error: 'Please enter a valid email address.' });
+    const lower = email.toLowerCase().trim();
+
+    const { data: existing } = await db.from('users').select('id').eq('email', lower).maybeSingle();
+    if (existing) return res.status(409).json({ error: 'This email is already registered. Try signing in.' });
+    if (!mailer) return res.status(503).json({ error: 'Email service not configured.' });
+
+    const code = String(Math.floor(100000 + Math.random() * 900000));
+    await db.from('email_otps').delete().eq('email', lower);           // clear old codes
+    await db.from('email_otps').insert({ email: lower, code, expires_at: new Date(Date.now() + 10 * 60 * 1000).toISOString() });
+
+    await mailer.sendMail({
+      from: `"BrainSpark AI" <${process.env.EMAIL_USER}>`, to: lower,
+      subject: 'Your BrainSpark AI verification code',
+      html: `<div style="font-family:sans-serif;max-width:440px;margin:auto;padding:24px;text-align:center"><h2 style="color:#6366F1">Verify your email</h2><p>Your verification code is:</p><div style="font-size:34px;font-weight:800;letter-spacing:8px;color:#1e293b;margin:18px 0">${code}</div><p style="color:#888;font-size:12px">Expires in 10 minutes. If you didn't request this, ignore it.</p></div>`,
+    });
+    res.json({ success: true });
+  } catch (e) { console.error('[send-otp]', e); res.status(500).json({ error: 'Could not send verification code.' }); }
+});
+
+app.post('/api/auth/verify-otp', async (req, res) => {
+  try {
+    const { email, code } = req.body;
+    if (!email || !code) return res.status(400).json({ error: 'Email and code required' });
+    const lower = email.toLowerCase().trim();
+    const { data: rec } = await db.from('email_otps').select('*').eq('email', lower).order('created_at', { ascending: false }).limit(1).maybeSingle();
+    if (!rec)                                   return res.status(400).json({ error: 'No code found. Request a new one.' });
+    if (new Date(rec.expires_at) < new Date())  return res.status(400).json({ error: 'Code expired. Request a new one.' });
+    if (rec.attempts >= 5)                      return res.status(429).json({ error: 'Too many attempts. Request a new code.' });
+    if (rec.code !== String(code).trim()) {
+      await db.from('email_otps').update({ attempts: rec.attempts + 1 }).eq('id', rec.id);
+      return res.status(400).json({ error: 'Incorrect code.' });
+    }
+    // verified — extend window to 30 min so they have time to finish the form
+    await db.from('email_otps').update({ verified: true, expires_at: new Date(Date.now() + 30 * 60 * 1000).toISOString() }).eq('id', rec.id);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+
 app.post('/api/auth/register', async (req, res) => {
   try {
     const { name, email, password, role = 'student' } = req.body;
@@ -353,12 +400,24 @@ app.post('/api/auth/register', async (req, res) => {
     if (!['student', 'teacher'].includes(role)) return res.status(400).json({ error: 'Invalid role' });
     const { data: ex } = await db.from('users').select('id').eq('email', email.toLowerCase()).maybeSingle();
     if (ex) return res.status(409).json({ error: 'Email already registered.' });
+
+    // ⬇️ NEW: require a verified email OTP before allowing registration
+    const { data: otp } = await db.from('email_otps')
+      .select('*').eq('email', email.toLowerCase().trim()).eq('verified', true)
+      .order('created_at', { ascending: false }).limit(1).maybeSingle();
+    if (!otp || new Date(otp.expires_at) < new Date())
+      return res.status(403).json({ error: 'Please verify your email before registering.', code: 'EMAIL_NOT_VERIFIED' });
+
     const { data: user, error } = await db.from('users').insert({
       name: name.trim(), email: email.toLowerCase().trim(),
       password_hash: await bcrypt.hash(password, 12),
       type: 'personal', role, provider: 'email',
     }).select().single();
     if (error) throw error;
+
+    // ⬇️ NEW: clean up used codes for this email
+    await db.from('email_otps').delete().eq('email', email.toLowerCase().trim());
+
     res.status(201).json(await buildLoginResponse(user, { ip: req.ip, userAgent: req.headers['user-agent'] }));
   } catch (e) { console.error('[register]', e); res.status(500).json({ error: 'Registration failed.' }); }
 });
