@@ -1423,25 +1423,47 @@ const isComputeRefusal = t =>
   /pending tool verification/i.test(t) ||
   /cannot responsibly publish/i.test(t);
 
+const SLOW_AI_TOOLS = new Set(['notes', 'cheatsheet', 'paper']);
+
 app.post('/api/ai/:tool', verifyToken, checkAccess, aiLimiter, async (req, res) => {
   const cfg = AI_CONFIGS[req.params.tool];
   if (!cfg) return res.status(400).json({ error: `Unknown tool: ${req.params.tool}` });
-  try {
-    const { messages, system = '', subject = '', chapter = '', chapters = [] } = req.body;
-    if (!Array.isArray(messages) || !messages.length)
-      return res.status(400).json({ error: 'Messages array required' });
 
+  const { messages, system = '', subject = '', chapter = '', chapters = [] } = req.body;
+  if (!Array.isArray(messages) || !messages.length)
+    return res.status(400).json({ error: 'Messages array required' });
+
+  // Slow tools (~60s, large output) keep the connection warm with a heartbeat
+  // so the browser/proxy never drops it mid-flight. Leading whitespace is valid
+  // JSON, so the client's res.json() still parses the final body.
+  let heartbeat = null;
+  if (SLOW_AI_TOOLS.has(req.params.tool)) {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.write(' ');                                       // open the stream now
+    heartbeat = setInterval(() => { try { res.write(' '); } catch {} }, 15000);
+  }
+
+  try {
     const { text, provider } = await callAI(messages, system, cfg.maxTokens, cfg.label);
 
     logActivity(req.user.id, cfg.label, { subject, chapter, chapters, xpEarned: cfg.xp, provider, meta: { subject, chapter } }).catch(console.error);
+
     const resp = { content: text, xpEarned: cfg.xp, provider };
     if (req.freeSecondsRemaining !== undefined) resp.secondsRemaining = req.freeSecondsRemaining;
-    res.json(resp);
+
+    if (heartbeat) { clearInterval(heartbeat); res.end(JSON.stringify(resp)); }  // status already 200
+    else res.json(resp);
   } catch (e) {
     console.error(`[AI /${req.params.tool}]`, e.message);
-    if (e.message?.includes('429') || e.message?.includes('rate_limit'))
-      return res.status(429).json({ error: 'AI is busy. Try again in a moment.' });
-    res.status(500).json({ error: 'AI service error.' });
+    if (heartbeat) {
+      clearInterval(heartbeat);
+      // headers already committed as 200 — send an error body the client detects
+      res.end(JSON.stringify({ error: 'AI service error. Please try again.', _failed: true }));
+    } else if (e.message?.includes('429') || e.message?.includes('rate_limit')) {
+      res.status(429).json({ error: 'AI is busy. Try again in a moment.' });
+    } else {
+      res.status(500).json({ error: 'AI service error.' });
+    }
   }
 });
 
@@ -1896,6 +1918,7 @@ Include exactly 6 Q&A items and 8 quiz questions. "ans" is 0-indexed.`
 // ════════════════════════════════════════════════════════════════
 const { EventEmitter } = require('events');
 const moduleEventBus = new Map(); // courseKey → EventEmitter
+const activeGenerations = new Set();
 
 function emitModuleEvent(courseKey, data) {
   moduleEventBus.get(courseKey)?.emit('update', data);
@@ -2128,43 +2151,51 @@ app.post('/api/chapter-courses/generate', verifyToken, checkAccess, async (req, 
 
   const listKey = moduleListKey(subject, cls, chapter);
 
-  // Return existing if already generated
-  const existing = await getCacheEntry(listKey);
-  if (existing) {
-    try {
-      const parsed = JSON.parse(existing.notes);
-      if (parsed?.modules?.length) {
+  // ── CONCURRENCY GUARD ───────────────────────────────────────
+  // A generation for this exact course is already running (this user, another
+  // user, or a previous click). Don't start a second one — tell the client to
+  // attach to the live stream / poll the cache instead of erroring.
+  if (activeGenerations.has(listKey)) {
+    return res.json({ courseKey: listKey, existing: true, resuming: true, alreadyRunning: true });
+  }
+  // Claim the lock NOW, before any await, so the check above is atomic.
+  activeGenerations.add(listKey);
 
-        // ✅ FIX 3: treat 'done' modules with no videoId as needing retry too
-        const needsWork = parsed.modules.filter(m =>
-          m.status !== 'done' || !m.videoId
-        )
+  try {
+    const existing = await getCacheEntry(listKey);
+
+    if (existing) {
+      let parsed = null;
+      try { parsed = JSON.parse(existing.notes); } catch {}
+
+      if (parsed?.modules?.length) {
+        const needsWork = parsed.modules.filter(m => m.status !== 'done' || !m.videoId);
 
         if (needsWork.length === 0) {
-          return res.json({ courseKey: listKey, existing: true })
+          activeGenerations.delete(listKey);            // complete — release lock
+          return res.json({ courseKey: listKey, existing: true });
         }
 
-        // Return existing immediately, resume in background
-        res.json({ courseKey: listKey, existing: true, resuming: true })
-
-        // If a generator is already running for this course, don't start a second one
-        if (moduleEventBus.has(listKey)) return
-
-        // ✅ Pass the full modules list; resumeChapterCourse will filter to only pending/error/broken
-        resumeChapterCourse(listKey, subject, cls, chapter, parsed.modules, req.user.id).catch(e =>
-          console.error('[resumeChapterCourse]', e.message)
-        )
-        return
+        res.json({ courseKey: listKey, existing: true, resuming: true });
+        resumeChapterCourse(listKey, subject, cls, chapter, parsed.modules, req.user.id)
+          .catch(e => console.error('[resumeChapterCourse]', e.message))
+          .finally(() => activeGenerations.delete(listKey));
+        return;
       }
-    } catch {}
-  }
-  // Start generation in background
-  res.json({ courseKey: listKey, existing: false });
+    }
 
-  const moduleCount = getModuleCount(req.user);
-  generateChapterCourse(listKey, subject, cls, chapter, moduleCount, req.user.id).catch(e =>
-    console.error('[generateChapterCourse]', e.message)
-  );
+    // Fresh generation in the background
+    res.json({ courseKey: listKey, existing: false });
+    const moduleCount = getModuleCount(req.user);
+    generateChapterCourse(listKey, subject, cls, chapter, moduleCount, req.user.id)
+      .catch(e => console.error('[generateChapterCourse]', e.message))
+      .finally(() => activeGenerations.delete(listKey));
+
+  } catch (e) {
+    activeGenerations.delete(listKey);                  // release on unexpected failure
+    console.error('[generate handler]', e.message);
+    if (!res.headersSent) res.status(500).json({ error: 'Could not start course generation. Please try again.' });
+  }
 });
 
 /**
