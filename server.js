@@ -217,44 +217,32 @@ function verifyAdmin(req, res, next) {
 // ════════════════════════════════════════════════════════════════
 //  FREE TIER — Wall-clock 10 minutes from first AI call
 // ════════════════════════════════════════════════════════════════
-const FREE_WINDOW_SECONDS = 600; // 10 minutes
+const FREE_WINDOW_SECONDS = 600; // legacy, unused
+const FREE_TRIAL_DAYS     = 60;  // 60-day free trial from signup
 
 async function checkAccess(req, res, next) {
-  // ── FREE ACCESS MODE — all users pass through ──
-  // Uncomment the block below to re-enable the free trial wall:
-  /*
-  if (req.user.type === 'school') return next();
+  if (req.user.type === 'school') return next();   // school users: unlimited
 
   const { data: u } = await db.from('users')
-    .select('subscription_status, subscription_expires_at, free_tier_started_at')
+    .select('subscription_status, subscription_expires_at, created_at')
     .eq('id', req.user.id).single();
 
+  // Active paid subscription that hasn't expired
   if (u?.subscription_status === 'active' && u.subscription_expires_at && new Date(u.subscription_expires_at) > new Date()) {
     return next();
   }
 
-  if (!u?.free_tier_started_at) {
-    await db.from('users')
-      .update({ free_tier_started_at: new Date().toISOString() })
-      .eq('id', req.user.id);
-    req.freeSecondsRemaining = FREE_WINDOW_SECONDS;
+  // 60-day free trial from signup
+  const trialEnd = new Date(new Date(u.created_at).getTime() + FREE_TRIAL_DAYS * 86400000);
+  if (Date.now() < trialEnd.getTime()) {
+    req.trialDaysRemaining = Math.ceil((trialEnd.getTime() - Date.now()) / 86400000);
     return next();
   }
 
-  const elapsed   = Math.floor((Date.now() - new Date(u.free_tier_started_at)) / 1000);
-  const remaining = FREE_WINDOW_SECONDS - elapsed;
-
-  if (remaining <= 0) {
-    return res.status(402).json({
-      error:            'Your 10-minute free trial has ended.',
-      code:             'SUBSCRIPTION_REQUIRED',
-      secondsRemaining: 0,
-    });
-  }
-
-  req.freeSecondsRemaining = remaining;
-  */
-  return next();
+  return res.status(402).json({
+    error: 'Your 60-day free trial has ended. Subscribe to continue.',
+    code:  'SUBSCRIPTION_REQUIRED',
+  });
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -592,20 +580,25 @@ app.get('/api/user/achievements', verifyToken, async (req, res) => {
 });
 
 app.get('/api/user/subscription', verifyToken, async (req, res) => {
-  const { data: user } = await db.from('users')
-    .select('subscription_status, subscription_plan, subscription_expires_at, free_tier_started_at, type, role')
+  const { data: u } = await db.from('users')
+    .select('subscription_status, subscription_plan, subscription_expires_at, created_at, type, role')
     .eq('id', req.user.id).single();
-  // Calculate seconds remaining for frontend
-  let freeSecondsRemaining = null;
-  if (user?.type === 'personal' && user.subscription_status !== 'active') {
-    if (!user.free_tier_started_at) {
-      freeSecondsRemaining = FREE_WINDOW_SECONDS; // not started yet
-    } else {
-      const elapsed = Math.floor((Date.now() - new Date(user.free_tier_started_at)) / 1000);
-      freeSecondsRemaining = Math.max(0, FREE_WINDOW_SECONDS - elapsed);
-    }
+  const now = Date.now();
+
+  if (u?.type === 'school') return res.json({ ...u, state: 'school', daysLeft: null, showBadge: false });
+
+  // Active paid subscription
+  if (u?.subscription_status === 'active' && u.subscription_expires_at && new Date(u.subscription_expires_at) > new Date()) {
+    const daysLeft = Math.ceil((new Date(u.subscription_expires_at).getTime() - now) / 86400000);
+    return res.json({ ...u, state: daysLeft <= 3 ? 'sub_expiring' : 'active', daysLeft, showBadge: daysLeft <= 3 });
   }
-  res.json({ ...user, freeSecondsRemaining });
+
+  // 60-day free trial from signup
+  const trialEnd = new Date(new Date(u.created_at).getTime() + FREE_TRIAL_DAYS * 86400000);
+  const daysLeft = Math.ceil((trialEnd.getTime() - now) / 86400000);
+  if (daysLeft > 0) return res.json({ ...u, state: 'trial', daysLeft, showBadge: true });
+
+  return res.json({ ...u, state: 'trial_expired', daysLeft: 0, showBadge: true });
 });
 
 // Saved Notes
