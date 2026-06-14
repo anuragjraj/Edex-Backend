@@ -820,6 +820,35 @@ app.post('/api/courses', verifyToken, async (req, res) => {
   } catch (e) { console.error('[courses]', e); res.status(500).json({ error: e.message }); }
 });
 
+
+// ── Shared notes: ONE note per subject+class+chapter+style, shared by ALL users ──
+function sharedNotesKey(subject, cls, chapter, style = 'Detailed') {
+  const safe = s => String(s || '').replace(/[^a-zA-Z0-9]/g, '').toLowerCase().slice(0, 24)
+  return `bsnotes-${safe(subject)}-${safe(cls)}-${safe(chapter)}-${safe(style)}`
+}
+
+app.get('/api/shared-notes/:key', verifyToken, async (req, res) => {
+  const { data } = await db.from('chapter_cache')
+    .select('notes, subject, class_level, chapter, updated_at')
+    .eq('cache_key', req.params.key).maybeSingle()
+  if (!data) return res.json(null)
+  res.json({ content: data.notes, subject: data.subject, classLevel: data.class_level, chapter: data.chapter, updatedAt: data.updated_at })
+})
+
+app.post('/api/shared-notes', verifyToken, async (req, res) => {
+  try {
+    const { subject, classLevel, chapter, style, content } = req.body
+    if (!subject || !chapter || !content) return res.status(400).json({ error: 'subject, chapter, content required' })
+    const key = sharedNotesKey(subject, classLevel, chapter, style)
+    const { data: existing } = await db.from('chapter_cache').select('cache_key').eq('cache_key', key).maybeSingle()
+    if (existing) return res.json({ ok: true, cached: true })   // first one wins — don't overwrite
+    await db.from('chapter_cache').upsert({
+      cache_key: key, notes: content, subject, class_level: classLevel, chapter,
+      generated_by: req.user.id, updated_at: new Date().toISOString(),
+    }, { onConflict: 'cache_key' })
+    res.json({ ok: true, cached: false })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
 // ════════════════════════════════════════════════════════════════
 //  ROUTES: SEARCH
 // ════════════════════════════════════════════════════════════════
