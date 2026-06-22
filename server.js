@@ -573,6 +573,17 @@ app.post('/api/auth/logout', verifyToken, async (req, res) => {
 // ════════════════════════════════════════════════════════════════
 //  ROUTES: USER PROFILE & STATS
 // ════════════════════════════════════════════════════════════════
+
+app.put('/api/user/avatar', verifyToken, async (req, res) => {
+  const { avatar_url } = req.body;
+  if (!avatar_url) return res.status(400).json({ error: 'avatar_url required' });
+  const { error } = await db.from('users')
+    .update({ avatar_url, updated_at: new Date().toISOString() })
+    .eq('id', req.user.id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ ok: true, avatar_url });
+});
+
 app.get('/api/user/profile', verifyToken, async (req, res) => {
   const { data: user } = await db.from('users').select('*, schools(name, school_code, logo_url)').eq('id', req.user.id).maybeSingle();
   res.json(safeUser(user));
@@ -938,21 +949,65 @@ app.post('/api/shared-notes', verifyToken, async (req, res) => {
 //  ROUTES: SEARCH
 // ════════════════════════════════════════════════════════════════
 app.get('/api/search', verifyToken, async (req, res) => {
-  const { q } = req.query;
-  if (!q || q.length < 2) return res.json([]);
+  const { q = '', role = '', subject = '', classLevel = '' } = req.query;
   try {
+    const pick = obj => Array.isArray(obj) ? (obj[0] || {}) : (obj || {});
+
+    let base = db.from('users')
+      .select(`id, name, role, class_level, section, avatar_url, subject_specialization,
+               school_id, type,
+               user_profiles(teaches_subjects, teaches_classes, favourite_subject, headline),
+               user_xp(total_xp)`);
+
+    // Scope: school users see their own school; personal users see personal users
     if (req.user.type === 'school') {
       const { data: me } = await db.from('users').select('school_id').eq('id', req.user.id).single();
-      const { data } = await db.from('users')
-        .select('id, name, role, class_level, section, avatar_url, subject_specialization')
-        .eq('school_id', me.school_id).ilike('name', `%${q}%`).limit(20);
-      return res.json(data || []);
+      base = base.eq('school_id', me.school_id);
+    } else {
+      base = base.eq('type', 'personal');
     }
-    const { data } = await db.from('users')
-      .select('id, name, role, class_level, bio, avatar_url')
-      .eq('type', 'personal').ilike('name', `%${q}%`).limit(20);
-    res.json(data || []);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+
+    if (role)            base = base.eq('role', role);
+    if (q && q.length)   base = base.ilike('name', `%${q}%`);
+
+    let { data } = await base.limit(300);
+    data = (data || []).filter(u => u.id !== req.user.id);
+
+    // Subject filter — teachers only (matches teaches_subjects[] or specialization)
+    if (subject) {
+      data = data.filter(u => {
+        if (u.role !== 'teacher') return false;
+        const subs = pick(u.user_profiles).teaches_subjects || [];
+        const spec = (u.subject_specialization || '').toLowerCase();
+        return subs.includes(subject) || spec.includes(subject.toLowerCase());
+      });
+    }
+
+    // Class filter — teacher teaches_classes[] OR student's own class_level
+    if (classLevel) {
+      data = data.filter(u => {
+        const cls = pick(u.user_profiles).teaches_classes || [];
+        return cls.includes(classLevel) || u.class_level === classLevel;
+      });
+    }
+
+    // Rank by XP (highest first)
+    data.sort((a, b) => (pick(b.user_xp).total_xp || 0) - (pick(a.user_xp).total_xp || 0));
+
+    res.json(data.slice(0, 50).map(u => {
+      const p = pick(u.user_profiles), x = pick(u.user_xp);
+      return {
+        id: u.id, name: u.name, role: u.role,
+        class_level: u.class_level, section: u.section,
+        avatar_url: u.avatar_url,
+        subject_specialization: u.subject_specialization,
+        teaches_subjects: p.teaches_subjects || [],
+        teaches_classes:  p.teaches_classes  || [],
+        headline:         p.headline || '',
+        total_xp:         x.total_xp || 0,
+      };
+    }));
+  } catch (e) { console.error('[search]', e.message); res.status(500).json({ error: e.message }); }
 });
 
 // ════════════════════════════════════════════════════════════════
@@ -972,7 +1027,7 @@ app.get('/api/profiles/:userId', verifyToken, async (req, res) => {
     }
 
     const [userRes, profileRes, xpRes] = await Promise.all([
-      db.from('users').select('id, name, role, class_level, section, subject_specialization, school_id, created_at, type, bio, avatar_url').eq('id', userId).maybeSingle(),
+      db.from('users').select('id, name, role, class_level, section, subject_specialization, school_id, created_at, type, bio, avatar_url, schools(name)').eq('id', userId).maybeSingle(),
       db.from('user_profiles').select('*').eq('user_id', userId).maybeSingle(),
       db.from('user_xp').select('total_xp, current_streak, doubts_solved, quizzes_done, notes_made, papers_made, cheat_sheets_made, lesson_plans_made').eq('user_id', userId).maybeSingle(),
     ]);
@@ -983,7 +1038,7 @@ app.get('/api/profiles/:userId', verifyToken, async (req, res) => {
     try {
       const { data } = await db.rpc('get_xp_ranking', { p_user_id: userId });
       rankData = data;
-    } catch { /* RPC optional — ignore if missing */ }
+    } catch { /* RPC optional */ }
 
     res.json({
       user:    userRes.data,
@@ -999,33 +1054,84 @@ app.get('/api/profiles/:userId', verifyToken, async (req, res) => {
 
 app.put('/api/profiles/me', verifyToken, async (req, res) => {
   try {
-    const { headline, about, location, website_url, skills, languages, hobbies,
-            certifications, experience, education, visibility, banner_url } = req.body;
+    const {
+      headline, about, location, website_url, skills, languages, hobbies,
+      certifications, experience, education, visibility, banner_url,
+      teaches_subjects, teaches_classes, favourite_chapter,
+      favourite_subject, favourite_hobby, institution,
+    } = req.body;
+
     const { data, error } = await db.from('user_profiles').upsert({
-      user_id: req.user.id, headline, about, location, website_url, skills, languages,
-      hobbies, certifications, experience, education, visibility, banner_url,
+      user_id: req.user.id,
+      headline, about, location, website_url, skills, languages, hobbies,
+      certifications, experience, education, visibility, banner_url,
+      teaches_subjects, teaches_classes, favourite_chapter,
+      favourite_subject, favourite_hobby, institution,
       updated_at: new Date().toISOString(),
     }, { onConflict: 'user_id' }).select().single();
     if (error) throw error;
+
+    // Keep a teacher's subject_specialization roughly in sync for search/specialization display
+    if (Array.isArray(teaches_subjects)) {
+      await db.from('users')
+        .update({ subject_specialization: teaches_subjects.join(', ') })
+        .eq('id', req.user.id);
+    }
+
     res.json(data);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-
 // ════════════════════════════════════════════════════════════════
 //  ROUTES: MESSAGING
 // ════════════════════════════════════════════════════════════════
+
+// Total unread across all conversations (for the header badge)
+app.get('/api/messages/unread-count', verifyToken, async (req, res) => {
+  try {
+    const { data: convs } = await db.from('conversations')
+      .select('id').contains('participant_ids', [req.user.id]);
+    const ids = (convs || []).map(c => c.id);
+    if (!ids.length) return res.json({ count: 0 });
+    const { count } = await db.from('messages')
+      .select('id', { count: 'exact', head: true })
+      .in('conversation_id', ids)
+      .neq('sender_id', req.user.id)
+      .is('read_at', null);
+    res.json({ count: count || 0 });
+  } catch { res.json({ count: 0 }); }
+});
+
+// Mark every message the other person sent in this conversation as read
+app.post('/api/conversations/:id/read', verifyToken, async (req, res) => {
+  try {
+    const { data: conv } = await db.from('conversations').select('participant_ids').eq('id', req.params.id).single();
+    if (!conv?.participant_ids.includes(req.user.id)) return res.status(403).json({ error: 'Forbidden' });
+    await db.from('messages')
+      .update({ read_at: new Date().toISOString() })
+      .eq('conversation_id', req.params.id)
+      .neq('sender_id', req.user.id)
+      .is('read_at', null);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+
 async function canMessage(senderId, receiverId) {
+  if (!senderId || !receiverId || senderId === receiverId) return false;
   const [{ data: sender }, { data: receiver }] = await Promise.all([
     db.from('users').select('role, school_id, type').eq('id', senderId).single(),
     db.from('users').select('role, school_id, type').eq('id', receiverId).single(),
   ]);
   if (!sender || !receiver) return false;
-  // School users: must be same school + no student↔student
+
+  // Students may NEVER message other students (any account type).
+  if (sender.role === 'student' && receiver.role === 'student') return false;
+
+  // School users can only talk within their own school.
   if (sender.type === 'school' || receiver.type === 'school') {
     if (sender.school_id !== receiver.school_id) return false;
-    if (sender.role === 'student' && receiver.role === 'student') return false;
   }
-  return true;
+  return true; // student↔teacher, teacher↔teacher, teacher↔student all OK
 }
 
 app.get('/api/conversations', verifyToken, async (req, res) => {
@@ -1034,11 +1140,17 @@ app.get('/api/conversations', verifyToken, async (req, res) => {
       .select('id, participant_ids, last_message, last_message_at, created_at')
       .contains('participant_ids', [req.user.id])
       .order('last_message_at', { ascending: false });
-    // Fetch other participant info
+
     const enriched = await Promise.all((data || []).map(async c => {
       const otherId = c.participant_ids.find(id => id !== req.user.id);
-      const { data: other } = await db.from('users').select('id, name, role, class_level, avatar_url').eq('id', otherId).single();
-      return { ...c, other };
+      const { data: other } = await db.from('users')
+        .select('id, name, role, class_level, avatar_url').eq('id', otherId).single();
+      const { count } = await db.from('messages')
+        .select('id', { count: 'exact', head: true })
+        .eq('conversation_id', c.id)
+        .neq('sender_id', req.user.id)
+        .is('read_at', null);
+      return { ...c, other, unread_count: count || 0 };
     }));
     res.json(enriched);
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -1067,9 +1179,9 @@ app.get('/api/conversations/:id/messages', verifyToken, async (req, res) => {
     const { data: conv } = await db.from('conversations').select('participant_ids').eq('id', req.params.id).single();
     if (!conv?.participant_ids.includes(req.user.id)) return res.status(403).json({ error: 'Forbidden' });
     const { data } = await db.from('messages')
-      .select('id, sender_id, content, media_url, media_type, created_at')
+      .select('id, sender_id, content, media_url, media_type, read_at, created_at')
       .eq('conversation_id', req.params.id)
-      .order('created_at', { ascending: true }).limit(100);
+      .order('created_at', { ascending: true }).limit(200);
     res.json(data || []);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
