@@ -436,15 +436,16 @@ app.post('/api/auth/login', async (req, res) => {
 
 app.post('/api/auth/google', async (req, res) => {
   try {
-    const { idToken } = req.body;
+    const { idToken, role } = req.body;
     if (!idToken) return res.status(400).json({ error: 'Google token required' });
+    const signupRole = role === 'teacher' ? 'teacher' : 'student';
     const ticket  = await googleAuth.verifyIdToken({ idToken, audience: process.env.GOOGLE_CLIENT_ID });
     const payload = ticket.getPayload();
     const { email, name, picture, sub: googleId } = payload;
     let { data: user } = await db.from('users').select('*').eq('email', email.toLowerCase()).maybeSingle();
     if (!user) {
       const { data: newUser, error } = await db.from('users').insert({
-        name, email: email.toLowerCase(), provider: 'google', type: 'personal', role: 'student',
+        name, email: email.toLowerCase(), provider: 'google', type: 'personal', role: signupRole,
         avatar_url: picture, google_id: googleId, email_verified: true,
       }).select().single();
       if (error) throw error;
