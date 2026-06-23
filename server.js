@@ -953,61 +953,104 @@ app.get('/api/search', verifyToken, async (req, res) => {
   const { q = '', role = '', subject = '', classLevel = '' } = req.query;
   try {
     const pick = obj => Array.isArray(obj) ? (obj[0] || {}) : (obj || {});
+    let pool = [];
 
-    let base = db.from('users')
-      .select(`id, name, role, class_level, section, avatar_url, subject_specialization,
-               school_id, type,
-               user_profiles(teaches_subjects, teaches_classes, favourite_subject, headline),
-               user_xp(total_xp)`);
-
-    // Scope: school users see their own school; personal users see personal users
     if (req.user.type === 'school') {
       const { data: me } = await db.from('users').select('school_id').eq('id', req.user.id).single();
-      base = base.eq('school_id', me.school_id);
+      const schoolId = me.school_id;
+
+      // Registered users in this school
+      const { data: users } = await db.from('users')
+        .select(`id, name, role, class_level, section, avatar_url, subject_specialization, roll_number, employee_id,
+                 user_profiles(teaches_subjects, teaches_classes, headline),
+                 user_xp(total_xp)`)
+        .eq('school_id', schoolId).limit(3000);
+
+      const byRoll = new Set(), byEmp = new Set();
+      for (const usr of users || []) {
+        if (usr.roll_number) byRoll.add(usr.roll_number);
+        if (usr.employee_id) byEmp.add(usr.employee_id);
+        const p = pick(usr.user_profiles), x = pick(usr.user_xp);
+        pool.push({
+          id: usr.id, name: usr.name, role: usr.role,
+          class_level: usr.class_level, section: usr.section, avatar_url: usr.avatar_url,
+          subject_specialization: usr.subject_specialization,
+          teaches_subjects: p.teaches_subjects || [], teaches_classes: p.teaches_classes || [],
+          headline: p.headline || '', total_xp: x.total_xp || 0, has_account: true,
+        });
+      }
+
+      // Roster students with no account yet
+      if (role !== 'teacher') {
+        const { data: students } = await db.from('school_students')
+          .select('id, name, roll_number, class_level, section')
+          .eq('school_id', schoolId).eq('is_active', true).limit(10000);
+        for (const s of students || []) {
+          if (s.roll_number && byRoll.has(s.roll_number)) continue;
+          pool.push({
+            id: `roster-student-${s.id}`, name: s.name, role: 'student',
+            class_level: s.class_level, section: s.section, avatar_url: null,
+            subject_specialization: null, teaches_subjects: [], teaches_classes: [],
+            headline: '', total_xp: 0, has_account: false,
+          });
+        }
+      }
+
+      // Roster teachers with no account yet
+      if (role !== 'student') {
+        const { data: teachers } = await db.from('school_teachers')
+          .select('id, name, employee_id, subjects')
+          .eq('school_id', schoolId).eq('is_active', true).limit(3000);
+        for (const t of teachers || []) {
+          if (t.employee_id && byEmp.has(t.employee_id)) continue;
+          pool.push({
+            id: `roster-teacher-${t.id}`, name: t.name, role: 'teacher',
+            class_level: null, section: null, avatar_url: null,
+            subject_specialization: (t.subjects || []).join(', '),
+            teaches_subjects: t.subjects || [], teaches_classes: [],
+            headline: '', total_xp: 0, has_account: false,
+          });
+        }
+      }
     } else {
-      base = base.eq('type', 'personal');
+      // Personal users — only registered accounts exist
+      let base = db.from('users')
+        .select(`id, name, role, class_level, section, avatar_url, subject_specialization,
+                 user_profiles(teaches_subjects, teaches_classes, headline),
+                 user_xp(total_xp)`)
+        .eq('type', 'personal');
+      if (role) base = base.eq('role', role);
+      if (q && q.length) base = base.ilike('name', `%${q}%`);
+      const { data: users } = await base.limit(300);
+      for (const usr of users || []) {
+        const p = pick(usr.user_profiles), x = pick(usr.user_xp);
+        pool.push({
+          id: usr.id, name: usr.name, role: usr.role,
+          class_level: usr.class_level, section: usr.section, avatar_url: usr.avatar_url,
+          subject_specialization: usr.subject_specialization,
+          teaches_subjects: p.teaches_subjects || [], teaches_classes: p.teaches_classes || [],
+          headline: p.headline || '', total_xp: x.total_xp || 0, has_account: true,
+        });
+      }
     }
 
-    if (role)            base = base.eq('role', role);
-    if (q && q.length)   base = base.ilike('name', `%${q}%`);
-
-    let { data } = await base.limit(300);
-    data = (data || []).filter(u => u.id !== req.user.id);
-
-    // Subject filter — teachers only (matches teaches_subjects[] or specialization)
+    // Shared filters
+    let data = pool.filter(u => u.id !== req.user.id);
+    if (role)     data = data.filter(u => u.role === role);
+    if (q.trim()) data = data.filter(u => u.name.toLowerCase().includes(q.toLowerCase()));
     if (subject) {
       data = data.filter(u => {
         if (u.role !== 'teacher') return false;
-        const subs = pick(u.user_profiles).teaches_subjects || [];
+        const subs = u.teaches_subjects || [];
         const spec = (u.subject_specialization || '').toLowerCase();
         return subs.includes(subject) || spec.includes(subject.toLowerCase());
       });
     }
-
-    // Class filter — teacher teaches_classes[] OR student's own class_level
     if (classLevel) {
-      data = data.filter(u => {
-        const cls = pick(u.user_profiles).teaches_classes || [];
-        return cls.includes(classLevel) || u.class_level === classLevel;
-      });
+      data = data.filter(u => (u.teaches_classes || []).includes(classLevel) || u.class_level === classLevel);
     }
-
-    // Rank by XP (highest first)
-    data.sort((a, b) => (pick(b.user_xp).total_xp || 0) - (pick(a.user_xp).total_xp || 0));
-
-    res.json(data.slice(0, 50).map(u => {
-      const p = pick(u.user_profiles), x = pick(u.user_xp);
-      return {
-        id: u.id, name: u.name, role: u.role,
-        class_level: u.class_level, section: u.section,
-        avatar_url: u.avatar_url,
-        subject_specialization: u.subject_specialization,
-        teaches_subjects: p.teaches_subjects || [],
-        teaches_classes:  p.teaches_classes  || [],
-        headline:         p.headline || '',
-        total_xp:         x.total_xp || 0,
-      };
-    }));
+    data.sort((a, b) => (b.total_xp || 0) - (a.total_xp || 0));
+    res.json(data.slice(0, 100));
   } catch (e) { console.error('[search]', e.message); res.status(500).json({ error: e.message }); }
 });
 
@@ -1553,9 +1596,45 @@ app.post('/api/buddy/chat', verifyToken, async (req, res) => {
 // ════════════════════════════════════════════════════════════════
 app.get('/api/school/analytics', verifyToken, async (req, res) => {
   const { data: u } = await db.from('users').select('school_id, role').eq('id', req.user.id).single();
-  if (!['admin', 'teacher'].includes(u?.role)) return res.status(403).json({ error: 'Admin/Teacher only' });
-  const { data } = await db.from('school_analytics').select('*').eq('school_id', u.school_id);
-  res.json(data || []);
+  if (!['admin', 'teacher', 'principal'].includes(u?.role)) return res.status(403).json({ error: 'Admin/Teacher only' });
+  const schoolId = u.school_id;
+  try {
+    // 1. Existing analytics for users who have logged in (unchanged source)
+    const { data: analytics } = await db.from('school_analytics').select('*').eq('school_id', schoolId);
+    const rows = [...(analytics || [])];
+
+    // 2. Which roster members already have accounts?
+    const { data: accounts } = await db.from('users')
+      .select('roll_number, employee_id').eq('school_id', schoolId);
+    const byRoll = new Set((accounts || []).map(a => a.roll_number).filter(Boolean));
+    const byEmp  = new Set((accounts || []).map(a => a.employee_id).filter(Boolean));
+
+    // 3. Roster students with no account yet
+    const { data: students } = await db.from('school_students')
+      .select('id, name, roll_number, class_level, section')
+      .eq('school_id', schoolId).eq('is_active', true);
+    for (const s of students || []) {
+      if (s.roll_number && byRoll.has(s.roll_number)) continue;
+      rows.push({ user_id: `roster-student-${s.id}`, name: s.name, role: 'student',
+        class_level: s.class_level, section: s.section,
+        total_xp: 0, streak: 0, doubts_solved: 0, quizzes_done: 0, notes_made: 0,
+        assignments_submitted: 0, last_active_at: null });
+    }
+
+    // 4. Roster teachers with no account yet
+    const { data: teachers } = await db.from('school_teachers')
+      .select('id, name, employee_id')
+      .eq('school_id', schoolId).eq('is_active', true);
+    for (const t of teachers || []) {
+      if (t.employee_id && byEmp.has(t.employee_id)) continue;
+      rows.push({ user_id: `roster-teacher-${t.id}`, name: t.name, role: 'teacher',
+        class_level: null, section: null,
+        total_xp: 0, streak: 0, doubts_solved: 0, quizzes_done: 0, notes_made: 0,
+        assignments_submitted: 0, last_active_at: null });
+    }
+
+    res.json(rows);
+  } catch (e) { console.error('[analytics]', e.message); res.status(500).json({ error: e.message }); }
 });
 
 // ════════════════════════════════════════════════════════════════
