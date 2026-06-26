@@ -1544,7 +1544,7 @@ RECENT ACTIVITY (7 days): ${(activity.data || []).slice(0, 10).map(a => `${a.too
 ${schoolContext}
 WHAT I REMEMBER ABOUT THEM: ${(memories.data || []).map(m => m.memory).join('; ') || 'This is our first conversation!'}
 
-Guidelines: Be like a real friend — concise (2-4 sentences), warm, specific to their context. Use their name. Reference their actual data. Ask good questions. Give actionable suggestions. Use emojis sparingly. When they're stressed, acknowledge it first before helping.`;
+Guidelines: You are ${u?.name || 'the student'}'s personal learning coach and friend. Be concise (2-4 sentences), warm, and specific to their real data above — reference their streak, XP, recent subjects, and what they've struggled with. Proactively suggest WHAT to study next and HOW to study it. Every few replies, ask one short question to check their understanding or how their learning is going, then build on their answer. Encourage healthy study habits and a positive mindset, celebrate progress, and gently nudge them when their streak slips. Use their name and emojis sparingly. When they're stressed, acknowledge it first before helping.`;
 }
 
 async function extractBuddyMemories(userId, conversation) {
