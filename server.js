@@ -1516,35 +1516,159 @@ setInterval(runAssignmentAnalysis, 15 * 60 * 1000);
 //  ROUTES: AI BUDDY
 // ════════════════════════════════════════════════════════════════
 async function getBuddyContext(userId) {
-  const sevenDaysAgo = new Date(Date.now() - 7 * 86400000).toISOString();
-  const { data: u } = await db.from('users').select('school_id, role, name, class_level').eq('id', userId).single();
-  const [activity, xpData, memories] = await Promise.all([
-    db.from('activity_log').select('tool, subject, chapter, created_at').eq('user_id', userId).gte('created_at', sevenDaysAgo).limit(20),
-    db.from('user_xp').select('total_xp, current_streak, doubts_solved, quizzes_done, notes_made').eq('user_id', userId).single(),
-    db.from('ai_buddy_memories').select('memory, importance').eq('user_id', userId).order('importance', { ascending: false }).limit(15),
+  const now = Date.now();
+  const fourteenDaysAgo = new Date(now - 14 * 86400000).toISOString();
+
+  const { data: u } = await db.from('users')
+    .select('school_id, role, name, class_level, section, type')
+    .eq('id', userId).single();
+
+  const [activityRes, xpRes, memoriesRes] = await Promise.all([
+    db.from('activity_log')
+      .select('tool, subject, chapter, chapters, created_at')
+      .eq('user_id', userId).gte('created_at', fourteenDaysAgo)
+      .order('created_at', { ascending: false }).limit(40),
+    db.from('user_xp')
+      .select('total_xp, current_streak, doubts_solved, quizzes_done, notes_made, papers_made, flashcards_made')
+      .eq('user_id', userId).single(),
+    db.from('ai_buddy_memories')
+      .select('memory, importance')
+      .eq('user_id', userId).order('importance', { ascending: false }).limit(15),
   ]);
-  let schoolContext = '';
-  if (u?.school_id) {
-    const [notices, assignments] = await Promise.all([
-      db.from('school_notices').select('title, notice_type').eq('school_id', u.school_id).gte('created_at', sevenDaysAgo).limit(5),
-      db.from('assignments').select('title, subject, deadline').eq('school_id', u.school_id).gt('deadline', new Date().toISOString()).limit(5),
-    ]);
-    schoolContext = `
-Recent school notices: ${(notices.data || []).map(n => `[${n.notice_type}] ${n.title}`).join(' | ')}
-Upcoming assignments: ${(assignments.data || []).map(a => `${a.subject}: "${a.title}" due ${new Date(a.deadline).toLocaleDateString('en-IN')}`).join(' | ')}`;
+
+  const activity = activityRes.data || [];
+  const xp       = xpRes.data || {};
+  const memories = memoriesRes.data || [];
+  const firstName = (u?.name || 'there').split(' ')[0];
+
+  // ── helpers ──
+  const ago = iso => {
+    const days = Math.floor((now - new Date(iso).getTime()) / 86400000);
+    if (days <= 0) return 'today';
+    if (days === 1) return 'yesterday';
+    if (days < 7)  return `${days} days ago`;
+    return 'about a week ago';
+  };
+  const joinList = arr =>
+    arr.length <= 1 ? (arr[0] || '')
+    : arr.length === 2 ? `${arr[0]} and ${arr[1]}`
+    : `${arr.slice(0, -1).join(', ')} and ${arr[arr.length - 1]}`;
+  const phraseFor = (tool, n) => ({
+    notes:      n === 1 ? 'made notes' : `made ${n} sets of notes`,
+    quiz:       n === 1 ? 'took a quiz' : `took ${n} quizzes`,
+    flashcards: n === 1 ? 'revised with flashcards' : `made ${n} flashcard sets`,
+    doubt:      n === 1 ? 'asked a doubt' : `asked ${n} doubts`,
+    courses:    n === 1 ? 'watched a video module' : `watched ${n} video modules`,
+    paper:      'made a question paper',
+    cheatsheet: 'made a cheat sheet',
+    lessonplan: 'made a lesson plan',
+  }[tool] || tool);
+
+  // ── recap of the most recent study focus (facts only) ──
+  let recapLine = 'No study sessions yet — this looks like a fresh start, so help them pick a first topic.';
+  let lastTopicLine = '';
+  let daysSinceStudy = null;
+  if (activity.length) {
+    const last  = activity[0];
+    const topic = last.chapter || (last.chapters || [])[0] || '';
+    daysSinceStudy = Math.floor((now - new Date(last.created_at).getTime()) / 86400000);
+    const sameTopic = activity.filter(a =>
+      a.subject === last.subject &&
+      (!topic || a.chapter === topic || (a.chapters || []).includes(topic))
+    );
+    const counts = {};
+    for (const a of sameTopic) counts[a.tool] = (counts[a.tool] || 0) + 1;
+    const parts = Object.entries(counts).map(([t, n]) => phraseFor(t, n));
+    recapLine = `Last active ${ago(last.created_at)}. Most recent focus: ${last.subject}${topic ? ` › ${topic}` : ''}, where they ${joinList(parts)}.`;
+    lastTopicLine = `LAST TOPIC = "${topic || last.subject}" in ${last.subject}.`;
   }
-  return `You are ${u?.name || 'a student'}'s AI Study Buddy — warm, encouraging, and genuinely helpful like a caring friend who truly knows them.
+  const subjectsTouched = [...new Set(activity.map(a => a.subject).filter(Boolean))].slice(0, 5);
 
-WHO THEY ARE:
-- Name: ${u?.name} | Role: ${u?.role} | Class: ${u?.class_level || 'N/A'}
-- XP: ${xpData.data?.total_xp || 0} | Streak: ${xpData.data?.current_streak || 0} days
-- Doubts: ${xpData.data?.doubts_solved || 0} | Quizzes: ${xpData.data?.quizzes_done || 0}
+  // ── school data (assignments / notices / today's timetable) ──
+  let schoolContext = '';
+  const isSchool = !!u?.school_id;
+  if (isSchool) {
+    const todayName = new Date().toLocaleDateString('en-US', { weekday: 'long' });
+    const [noticesRes, assignRes, ttRes] = await Promise.all([
+      db.from('school_notices')
+        .select('title, notice_type, content')
+        .eq('school_id', u.school_id)
+        .order('is_pinned', { ascending: false })
+        .order('created_at', { ascending: false }).limit(6),
+      db.from('assignments')
+        .select('title, subject, deadline')
+        .eq('school_id', u.school_id)
+        .gt('deadline', new Date().toISOString())
+        .order('deadline', { ascending: true }).limit(6),
+      u.class_level
+        ? db.from('timetables').select('schedule').eq('school_id', u.school_id).eq('class_level', u.class_level).maybeSingle()
+        : Promise.resolve({ data: null }),
+    ]);
 
-RECENT ACTIVITY (7 days): ${(activity.data || []).slice(0, 10).map(a => `${a.tool}(${a.subject})`).join(', ') || 'None yet'}
+    const assignLines = (assignRes.data || []).map(a => {
+      const d = Math.ceil((new Date(a.deadline) - now) / 86400000);
+      const when = d <= 0 ? 'due today' : d === 1 ? 'due tomorrow' : `due in ${d} days`;
+      return `"${a.title}" (${a.subject}) — ${when}`;
+    });
+    const noticeLines = (noticesRes.data || []).map(n =>
+      `[${n.notice_type}] ${n.title}${n.content ? ` — ${String(n.content).slice(0, 90)}` : ''}`
+    );
+    const week     = ttRes.data?.schedule?.week || [];
+    const todayRow = week.find(d => d.day === todayName);
+    const todayClasses = (todayRow?.periods || []).map(p => p.subject).filter(Boolean).join(', ');
+
+    schoolContext = `
+SCHOOL CONTEXT (this person is on the school portal — these come FIRST):
+- Pending assignments (most urgent first): ${assignLines.length ? assignLines.join(' | ') : 'none pending'}
+- Recent notices: ${noticeLines.length ? noticeLines.join(' | ') : 'none'}
+- Today is ${todayName}. Today's classes: ${todayClasses || 'no timetable set for their class'}`;
+  }
+
+  // ── opening playbook differs for school vs personal/teacher ──
+  const schoolOpening = `
+HOW TO OPEN (first message of a session):
+1. Greet ${firstName} warmly by name. ${daysSinceStudy != null && daysSinceStudy >= 1 ? "It's been a little while — give a genuine 'welcome back'." : ''}
+2. One quick, friendly line asking how their day / school is going.
+3. Surface SCHOOL items first: mention the single most urgent pending assignment and its deadline, and any important notice. Offer to help plan/finish them. If a notice mentions a sports day, competition, or cultural event, warmly ask if they're taking part in any event.
+4. THEN recap their learning using the RECENT LEARNING facts (real "yesterday / N days ago" timing and exact counts) and ask if they want to continue the same topic or pick a new one.
+5. After the warm + planning part, gently steer toward actually studying — that's the point of being here.`;
+
+  const personalOpening = `
+HOW TO OPEN (first message of a session):
+1. Greet ${firstName} warmly by name. ${daysSinceStudy != null && daysSinceStudy >= 1 ? "It's been a little while — give a genuine 'welcome back'." : ''}
+2. One quick, friendly line asking how their day is going.
+3. Recap what they were last learning using the RECENT LEARNING facts below (real "yesterday / N days ago" timing and exact counts). Example shape: "Last time you were on Biology › Living Things and made 2 sets of notes and took a quiz."
+4. Ask whether they'd like to continue the SAME topic or move to a new one — let them choose, don't decide for them.`;
+
+  const featureGuide = u?.role === 'teacher'
+    ? `RECOMMEND THE RIGHT FEATURE (be specific, tie it to their topic):
+- Understand a chapter deeply → Notes
+- Test understanding → Quiz   • Quick revision → Flashcards
+- One specific question → Doubt Solver   • Learn from video, whole chapter → Chapter Courses
+- Plan a class → Lesson Planner   • Build a test → Question Paper`
+    : `RECOMMEND THE RIGHT FEATURE (be specific, tie it to their topic):
+- Understand a chapter deeply → Notes
+- Test yourself → Quiz   • Quick revision before a test → Flashcards
+- Stuck on one specific question → Doubt Solver   • Learn from video, whole chapter → Chapter Courses`;
+
+  return `You are ${firstName}'s personal AI study buddy — warm, encouraging, like a caring friend who is also a great teacher. You genuinely know them from the real data below.
+
+WHO THEY ARE: ${u?.name} · ${u?.role}${u?.class_level ? ` · ${u.class_level}` : ''}${isSchool ? ' · school portal' : ''}
+PROGRESS: ${xp.total_xp || 0} XP · ${xp.current_streak || 0}-day streak · ${xp.doubts_solved || 0} doubts · ${xp.quizzes_done || 0} quizzes · ${xp.notes_made || 0} notes
+RECENT LEARNING: ${recapLine}
+SUBJECTS RECENTLY TOUCHED: ${subjectsTouched.join(', ') || 'none yet'}
+${lastTopicLine}
 ${schoolContext}
-WHAT I REMEMBER ABOUT THEM: ${(memories.data || []).map(m => m.memory).join('; ') || 'This is our first conversation!'}
+WHAT I REMEMBER ABOUT THEM: ${memories.map(m => m.memory).join('; ') || 'this is our first real chat'}
+${isSchool ? schoolOpening : personalOpening}
 
-Guidelines: You are ${u?.name || 'the student'}'s personal learning coach and friend. Be concise (2-4 sentences), warm, and specific to their real data above — reference their streak, XP, recent subjects, and what they've struggled with. Proactively suggest WHAT to study next and HOW to study it. Every few replies, ask one short question to check their understanding or how their learning is going, then build on their answer. Encourage healthy study habits and a positive mindset, celebrate progress, and gently nudge them when their streak slips. Use their name and emojis sparingly. When they're stressed, acknowledge it first before helping.`;
+${featureGuide}
+
+NON-NEGOTIABLE RULES:
+- Keep replies short and crisp — usually 2-4 sentences, warm peer tone, no bullet lists.
+- NEVER argue with or contradict the user. If they tell you their mood, plan, or what they did, believe them and respond accordingly.
+- NEVER assume facts you don't have. State only what's in the data above; if you don't know, ask one short question instead of guessing.
+- Use their name occasionally and emojis sparingly.${isSchool ? '\n- You help with school life and planning too (assignments, timetable, events), not just academics — keep a balance of casual and serious.' : ''}`;
 }
 
 async function extractBuddyMemories(userId, conversation) {
