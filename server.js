@@ -172,27 +172,7 @@ async function callAI(messages, system = '', maxTokens = 2000, tool = 'default')
 }
 
 
-// ── NCERT sub-topics for a chapter (AI-generated, cached) ──
-app.post('/api/subtopics', verifyToken, async (req, res) => {
-  const { subject, cls, chapter } = req.body;
-  if (!subject || !cls || !chapter) return res.json({ subtopics: [] });
-  const safe = s => String(s || '').replace(/[^a-zA-Z0-9]/g, '').toLowerCase().slice(0, 20);
-  const key = `bs-subtopics-${safe(subject)}-${safe(cls)}-${safe(chapter)}`;
 
-  const cached = await getCacheEntry(key);
-  if (cached) { try { return res.json(JSON.parse(cached.notes)); } catch {} }
-
-  try {
-    const prompt = `You are a CBSE curriculum expert. List the actual sub-topics / section headings of the NCERT chapter "${chapter}" for ${subject}, ${cls} (CBSE board), in the order they appear in the textbook. Use the real NCERT section names only — do not invent topics from other classes.
-Return ONLY JSON (no markdown): {"subtopics":["Sub-topic 1","Sub-topic 2"]}
-Give between 4 and 12 items.`;
-    const r = await callAI([{ role: 'user', content: prompt }], '', 700, 'flashcards');
-    let parsed; try { parsed = JSON.parse(r.text.replace(/```[\w]*\n?/gi, '').trim()); } catch { parsed = {}; }
-    const out = { subtopics: Array.isArray(parsed.subtopics) ? parsed.subtopics.slice(0, 12) : [] };
-    await setCacheEntry(key, out, { subject, cls, chapter });
-    res.json(out);
-  } catch { res.json({ subtopics: [] }); }
-});
 
 // ════════════════════════════════════════════════════════════════
 //  Auth Helpers
